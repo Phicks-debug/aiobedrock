@@ -3,13 +3,17 @@ from setuptools import setup, find_packages
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
+with open("requirements.txt", "r", encoding="utf-8") as fh:
+    requirements = fh.read().splitlines()
+
 setup(
     name="aiobedrock",
-    version="0.1.1",
+    version="0.1.2",
     author="Phicks",
     author_email="an.tq@techxcorp.com",
     description="AWS boto3 bedrock client in async",
     long_description=long_description,
+    install_requires=requirements,
     long_description_content_type="text/markdown",
     url="https://github.com/Phicks-debug/aiobedrock",
     packages=find_packages(),

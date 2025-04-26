@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: aiobedrock
-Version: 0.1.1
+Version: 0.1.2
 Summary: AWS boto3 bedrock client in async
 Home-page: https://github.com/Phicks-debug/aiobedrock
 Author: Phicks
@@ -18,6 +18,9 @@ Classifier: Topic :: System :: Logging
 Requires-Python: >=3.9
 Description-Content-Type: text/markdown
 License-File: LICENSE
+Requires-Dist: boto3>=1.38.0
+Requires-Dist: aiohttp>=3.11.16
+Requires-Dist: orjson>=3.10.16
 Dynamic: author
 Dynamic: author-email
 Dynamic: classifier
@@ -25,6 +28,7 @@ Dynamic: description
 Dynamic: description-content-type
 Dynamic: home-page
 Dynamic: license-file
+Dynamic: requires-dist
 Dynamic: requires-python
 Dynamic: summary
 
