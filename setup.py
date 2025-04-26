@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="aiobedrock",
-    version="0.1.0",
+    version="0.1.1",
     author="Phicks",
     author_email="an.tq@techxcorp.com",
     description="AWS boto3 bedrock client in async",
