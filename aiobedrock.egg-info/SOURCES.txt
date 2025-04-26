@@ -1,0 +1,11 @@
+LICENSE
+MANIFEST.in
+README.md
+pyproject.toml
+setup.py
+aiobedrock/__init__.py
+aiobedrock/main.py
+aiobedrock.egg-info/PKG-INFO
+aiobedrock.egg-info/SOURCES.txt
+aiobedrock.egg-info/dependency_links.txt
+aiobedrock.egg-info/top_level.txt

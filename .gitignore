@@ -1,0 +1,92 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.env
+.venv
+env/
+venv/
+ENV/
+*.so
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bootstrap
+
+# Model files
+*.safetensors
+*.bin
+*.onnx
+*.pt
+*.pth
+*.h5
+*.hdf5
+*.pkl
+*.model
+go-lang/aws-rag-platform/models/
+go-lang/aws-rag-platform/cmd/models/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Test
+coverage/
+.pytest_cache/
+
+# qdrant
+qdrant_storage
+
+# docker
+docker-compose.generated.yml
+*.pem
+*.gguf
+*.tar.gz
+llama.cpp
+
+# terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+*.hcl
+*.zip
+*.tar.gz
+
+# Node.js
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Python
+*.pyc
+.venv
+myenv
