@@ -1,8 +1,9 @@
-import re
 import boto3
 import base64
 import orjson
 import aiohttp
+import struct
+import io
 
 from botocore.awsrequest import AWSRequest
 from botocore.auth import SigV4Auth
@@ -185,19 +186,76 @@ class Client:
         return dict(request.headers)
 
     @staticmethod
-    def __parse_chunk_async(chunk: dict) -> bytes:
-        # Decode the chunk with 'ignore' to skip invalid bytes
-        message = chunk.decode("utf-8", errors="ignore")
+    def __parse_chunk_async(chunk: bytes) -> dict:
+        """Parse an AWS Event Stream chunk into a usable message.
 
-        json_pattern = re.compile(r'{"bytes":"(.*?)"}')
+        The event stream format consists of:
+        - 4 bytes: Total message length
+        - 4 bytes: Headers length
+        - 4 bytes: CRC checksum for the prelude
+        - Headers content
+        - Message content
+        - 4 bytes: CRC checksum for the entire message
 
-        # Find all JSON objects in the message
-        matches = json_pattern.finditer(message)
+        Returns:
+            dict: The decoded message content
+        """
+        if not chunk:
+            return None
 
-        for m in matches:
-            p_out = orjson.loads(m.group(0))
-            # Decode the response json contents.
-            return base64.b64decode(p_out["bytes"])
+        try:
+            # Use a BytesIO to parse the binary format
+            stream = io.BytesIO(chunk)
 
-        # Return nothing if nothing is parsed
-        return b""
+            # Read the prelude (first 12 bytes)
+            total_length = struct.unpack(">I", stream.read(4))[
+                0
+            ]  # Big-endian 4-byte unsigned int
+            headers_length = struct.unpack(">I", stream.read(4))[0]
+            # Skip the prelude CRC
+            stream.read(4)
+
+            # Parse headers
+            headers = {}
+            headers_end_pos = 12 + headers_length
+            while stream.tell() < headers_end_pos:
+                header_name_len = stream.read(1)[0]  # Single byte length
+                header_name = stream.read(header_name_len).decode("utf-8")
+                header_type = stream.read(1)[0]  # Header value type
+
+                # Handle different header value types
+                if header_type == 7:  # String
+                    # 2-byte length for string values
+                    value_len = struct.unpack(">H", stream.read(2))[0]
+                    value = stream.read(value_len).decode("utf-8")
+                    headers[header_name] = value
+                else:
+                    # Skip other header types for now
+                    # Type 0-6: bool, byte, short, int, long, timestamp, uuid
+                    type_lengths = {0: 0, 1: 1, 2: 2, 3: 4, 4: 8, 5: 8, 6: 16}
+                    if header_type in type_lengths:
+                        stream.read(type_lengths[header_type])
+
+            # Read the payload (everything between headers and the final CRC)
+            # Total - headers - prelude(12) - end CRC(4)
+            payload_length = total_length - headers_length - 16
+            payload = stream.read(payload_length)
+
+            # Parse the JSON payload
+            content = payload.decode("utf-8")
+
+            # Find the JSON object with the "bytes" field
+            payload_json = orjson.loads(content)
+            if "bytes" in payload_json:
+                # Decode base64-encoded message
+                bytes_content = payload_json["bytes"]
+                decoded = base64.b64decode(bytes_content)
+                message_json = orjson.loads(decoded)
+                # Save headers for context
+                message_json["__headers"] = headers
+                return message_json
+            return payload_json
+
+        except Exception as e:
+            # On error, return the raw chunk
+            return {"error": str(e), "raw": chunk}

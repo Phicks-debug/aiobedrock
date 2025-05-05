@@ -16,7 +16,10 @@ async def main():
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "What can you do?"},
+                        {
+                            "type": "text",
+                            "text": "Bạn có thể làm được những gì?",
+                        },
                     ],
                 }
             ],
@@ -29,7 +32,7 @@ async def main():
             contentType="application/json",
             trace="ENABLED_FULL",
         ):
-            print(json.loads(chunk.decode("utf-8")))
+            print(chunk)
 
 
 if __name__ == "__main__":
