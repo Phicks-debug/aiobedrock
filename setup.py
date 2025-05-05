@@ -8,7 +8,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="aiobedrock",
-    version="0.1.4",
+    version="0.1.41",
     author="Phicks",
     author_email="an.tq@techxcorp.com",
     description="AWS boto3 bedrock client in async",

@@ -250,10 +250,7 @@ class Client:
                 # Decode base64-encoded message
                 bytes_content = payload_json["bytes"]
                 decoded = base64.b64decode(bytes_content)
-                message_json = orjson.loads(decoded)
-                # Save headers for context
-                message_json["__headers"] = headers
-                return message_json
+                return decoded
             return payload_json
 
         except Exception as e:
