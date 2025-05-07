@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: aiobedrock
-Version: 0.1.41
+Version: 0.1.42
 Summary: AWS boto3 bedrock client in async
 Home-page: https://github.com/Phicks-debug/aiobedrock
 Author: Phicks
