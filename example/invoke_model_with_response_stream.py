@@ -32,7 +32,7 @@ async def main():
             contentType="application/json",
             trace="ENABLED_FULL",
         ):
-            print(chunk)
+            print(chunk.decode("utf-8"))
 
 
 if __name__ == "__main__":
