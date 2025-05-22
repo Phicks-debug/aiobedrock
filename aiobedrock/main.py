@@ -63,8 +63,7 @@ class Client:
         self, body: str, modelId: str, **kwargs
     ) -> AsyncGenerator[Union[Dict[str, Any], bytes], None]:
         """
-        Invoke a model with streaming response
-        using botocore's event stream parsing
+        Invoke a model with streaming response with memory management
         """
         url = f"https://bedrock-runtime.{self.region_name}.amazonaws.com/model/{modelId}/invoke-with-response-stream"  # noqa: E501
         headers = self._signed_request(
@@ -153,7 +152,6 @@ class Client:
             # Create a BytesIO stream for the message parser
             stream = io.BytesIO(buffer)
 
-            # Try to parse the message
             try:
                 message = EventStreamMessage.from_response_dict(
                     {"body": stream},
@@ -165,7 +163,6 @@ class Client:
                 return message, consumed
 
             except NoInitialResponseError:
-                # This means we don't have enough data yet
                 return None, 0
             except Exception:
                 # Try the manual approach as fallback
