@@ -18,25 +18,28 @@ log = logsim.CustomLogger()
 class Client:
     def __init__(self, region_name: str):
         self.region_name = region_name
-        conn = aiohttp.TCPConnector(
+        self.connector = aiohttp.TCPConnector(
             limit=10000,
             ttl_dns_cache=3600,
             use_dns_cache=True,
             enable_cleanup_closed=True,
         )
-        self.session = aiohttp.ClientSession(connector=conn)
+        self.session = None
         boto3_session = boto3.Session(region_name=region_name)
         self.credentials = boto3_session.get_credentials()
 
     async def __aenter__(self):
+        if self.session is None:
+            self.session = aiohttp.ClientSession(connector=self.connector)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
     async def close(self):
-        if self.session:
+        if self.session is not None:
             await self.session.close()
+            self.session = None
 
     async def invoke_model(self, body: str, modelId: str, **kwargs) -> bytes:
         """Invoke a model and return the response body as bytes"""
