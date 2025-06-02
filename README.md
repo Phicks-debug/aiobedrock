@@ -150,6 +150,9 @@ Client(region_name: str)
 
 Creates a new Bedrock client instance.
 
+The underlying `aiohttp.ClientSession` is created lazily when entering the
+async context via `async with`.
+
 - **region_name**: AWS region where Bedrock is available (e.g., "us-east-1", "us-west-2", "ap-southeast-1")
 
 ### Methods
