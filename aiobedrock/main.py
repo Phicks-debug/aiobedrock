@@ -23,7 +23,6 @@ class Client:
             ttl_dns_cache=3600,
             use_dns_cache=True,
             enable_cleanup_closed=True,
-            verify_ssl=True,
         )
         self.session = aiohttp.ClientSession(connector=conn)
         boto3_session = boto3.Session(region_name=region_name)
