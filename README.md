@@ -175,10 +175,11 @@ Invokes a Bedrock model and returns the complete response.
 #### invoke_model_with_response_stream
 
 ```python
-async invoke_model_with_response_stream(body: str, modelId: str, **kwargs) -> AsyncGenerator[bytes, None]
+async invoke_model_with_response_stream(body: str, modelId: str, **kwargs) -> AsyncGenerator[Union[Dict[str, Any], bytes], None]
 ```
 
-Invokes a Bedrock model and returns an asynchronous generator that yields response chunks.
+Invokes a Bedrock model and returns an asynchronous generator. The generator
+yields either parsed JSON objects or raw byte chunks depending on the payload.
 
 - Parameters are the same as `invoke_model`
 
