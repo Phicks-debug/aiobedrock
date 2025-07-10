@@ -1,4 +1,4 @@
-boto3>=1.38.21
-aiohttp>=3.11.16
-orjson>=3.10.16
+boto3>=1.39.4
+aiohttp>=3.12.13
+orjson>=3.10.18
 logsim>=0.2.32

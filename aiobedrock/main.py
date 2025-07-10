@@ -16,7 +16,7 @@ log = logsim.CustomLogger()
 
 
 class Client:
-    def __init__(self, region_name: str):
+    def __init__(self, region_name: str, assume_role_arn: str = None):
         self.region_name = region_name
         self.connector = aiohttp.TCPConnector(
             limit=10000,
@@ -25,7 +25,29 @@ class Client:
             enable_cleanup_closed=True,
         )
         self.session = None
-        boto3_session = boto3.Session(region_name=region_name)
+
+        if assume_role_arn:
+            sts_client = boto3.client("sts")
+            response = sts_client.assume_role(
+                RoleArn=assume_role_arn,
+                RoleSessionName="aiobedrock",
+            )
+
+            # Extract temporary credentials
+            credentials = response["Credentials"]
+            access_key = credentials["AccessKeyId"]
+            secret_key = credentials["SecretAccessKey"]
+            session_token = credentials["SessionToken"]
+
+        if assume_role_arn is None:
+            boto3_session = boto3.Session(region_name=region_name)
+        else:
+            boto3_session = boto3.Session(
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                aws_session_token=session_token,
+                region_name=region_name,
+            )
         self.credentials = boto3_session.get_credentials()
 
     async def __aenter__(self):

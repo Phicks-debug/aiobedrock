@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: aiobedrock
-Version: 0.2.1
+Version: 0.2.2
 Summary: AWS boto3 bedrock client in async
 Home-page: https://github.com/Phicks-debug/aiobedrock
 Author: Phicks
@@ -18,9 +18,9 @@ Classifier: Topic :: System :: Logging
 Requires-Python: >=3.9
 Description-Content-Type: text/markdown
 License-File: LICENSE
-Requires-Dist: boto3>=1.38.21
-Requires-Dist: aiohttp>=3.11.16
-Requires-Dist: orjson>=3.10.16
+Requires-Dist: boto3>=1.39.4
+Requires-Dist: aiohttp>=3.12.13
+Requires-Dist: orjson>=3.10.18
 Requires-Dist: logsim>=0.2.32
 Dynamic: author
 Dynamic: author-email
@@ -185,6 +185,9 @@ Client(region_name: str)
 
 Creates a new Bedrock client instance.
 
+The underlying `aiohttp.ClientSession` is created lazily when entering the
+async context via `async with`.
+
 - **region_name**: AWS region where Bedrock is available (e.g., "us-east-1", "us-west-2", "ap-southeast-1")
 
 ### Methods
@@ -210,10 +213,11 @@ Invokes a Bedrock model and returns the complete response.
 #### invoke_model_with_response_stream
 
 ```python
-async invoke_model_with_response_stream(body: str, modelId: str, **kwargs) -> AsyncGenerator[bytes, None]
+async invoke_model_with_response_stream(body: str, modelId: str, **kwargs) -> AsyncGenerator[Union[Dict[str, Any], bytes], None]
 ```
 
-Invokes a Bedrock model and returns an asynchronous generator that yields response chunks.
+Invokes a Bedrock model and returns an asynchronous generator. The generator
+yields either parsed JSON objects or raw byte chunks depending on the payload.
 
 - Parameters are the same as `invoke_model`
 
