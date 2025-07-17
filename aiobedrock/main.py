@@ -1,10 +1,11 @@
+import io
 import boto3
 import base64
 import orjson
 import aiohttp
 import struct
 import logsim
-import io
+from datetime import datetime, timezone
 
 from botocore.awsrequest import AWSRequest
 from botocore.auth import SigV4Auth
@@ -18,6 +19,7 @@ log = logsim.CustomLogger()
 class Client:
     def __init__(self, region_name: str, assume_role_arn: str = None):
         self.region_name = region_name
+        self.assume_role_arn = assume_role_arn
         self.connector = aiohttp.TCPConnector(
             limit=10000,
             ttl_dns_cache=3600,
@@ -25,30 +27,68 @@ class Client:
             enable_cleanup_closed=True,
         )
         self.session = None
+        self.expiration = None
+        self.access_key = None
+        self.secret_key = None
+        self.session_token = None
 
-        if assume_role_arn:
+        # Initialize credentials
+        self._refresh_credentials()
+
+    def _refresh_credentials(self):
+        """Refresh AWS credentials, handling role assumption if needed"""
+        if self.assume_role_arn:
             sts_client = boto3.client("sts")
             response = sts_client.assume_role(
-                RoleArn=assume_role_arn,
+                RoleArn=self.assume_role_arn,
                 RoleSessionName="aiobedrock",
             )
 
             # Extract temporary credentials
             credentials = response["Credentials"]
-            access_key = credentials["AccessKeyId"]
-            secret_key = credentials["SecretAccessKey"]
-            session_token = credentials["SessionToken"]
+            self.access_key = credentials["AccessKeyId"]
+            self.secret_key = credentials["SecretAccessKey"]
+            self.session_token = credentials["SessionToken"]
+            self.expiration = credentials["Expiration"]
 
-        if assume_role_arn is None:
-            boto3_session = boto3.Session(region_name=region_name)
-        else:
+            log.info(f"Refreshed credentials, expires at: {self.expiration}")
+
+            # Create session with temporary credentials
             boto3_session = boto3.Session(
-                aws_access_key_id=access_key,
-                aws_secret_access_key=secret_key,
-                aws_session_token=session_token,
-                region_name=region_name,
+                aws_access_key_id=self.access_key,
+                aws_secret_access_key=self.secret_key,
+                aws_session_token=self.session_token,
+                region_name=self.region_name,
             )
+        else:
+            # Use default credentials
+            boto3_session = boto3.Session(region_name=self.region_name)
+
         self.credentials = boto3_session.get_credentials()
+
+    def _are_credentials_expired(self) -> bool:
+        """Check if the current credentials are expired or about to expire"""
+        if not self.assume_role_arn or not self.expiration:
+            return False
+
+        # Check if credentials expire within the next 5 minutes
+        current_time = datetime.now(timezone.utc)
+        expiration_time = self.expiration
+
+        # Handle timezone-aware expiration time
+        if expiration_time.tzinfo is None:
+            expiration_time = expiration_time.replace(tzinfo=timezone.utc)
+
+        time_until_expiration = expiration_time - current_time
+        return time_until_expiration.total_seconds() < 300  # 5 minutes
+
+    def _ensure_valid_credentials(self):
+        """Ensure credentials are valid, refreshing if necessary"""
+        if not self.assume_role_arn:
+            return
+        if self._are_credentials_expired():
+            log.info("Credentials expired or expiring soon, refreshing...")
+            self._refresh_credentials()
 
     async def __aenter__(self):
         if self.session is None:
@@ -65,6 +105,9 @@ class Client:
 
     async def invoke_model(self, body: str, modelId: str, **kwargs) -> bytes:
         """Invoke a model and return the response body as bytes"""
+        # Ensure credentials are valid before making the request
+        self._ensure_valid_credentials()
+
         url = f"https://bedrock-runtime.{self.region_name}.amazonaws.com/model/{modelId}/invoke"  # noqa: E501
         headers = self._signed_request(
             body=body,
@@ -89,6 +132,9 @@ class Client:
         """
         Invoke a model with streaming response with memory management
         """
+        # Ensure credentials are valid before making the request
+        self._ensure_valid_credentials()
+
         url = f"https://bedrock-runtime.{self.region_name}.amazonaws.com/model/{modelId}/invoke-with-response-stream"  # noqa: E501
         headers = self._signed_request(
             body=body,

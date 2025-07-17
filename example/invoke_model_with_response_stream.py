@@ -5,7 +5,10 @@ from aiobedrock import Client
 
 
 async def main():
-    async with Client(region_name="ap-southeast-1") as client:
+    async with Client(
+        region_name="ap-southeast-1",
+        assume_role_arn="arn:aws:iam::130506138320:role/bedrock-cross-account-role",  # noqa: E501
+    ) as client:
         body = {
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 4096,
