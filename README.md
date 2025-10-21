@@ -23,8 +23,9 @@ pip install aiobedrock
 
 ## Requirements
 
-- Python 3.9 or later
+- Python 3.9 or later (tested through Python 3.14)
 - AWS credentials configured in your environment
+- boto3 1.35.84 or newer (installed automatically via dependencies)
 
 ## Quick Start
 
@@ -150,8 +151,9 @@ Client(region_name: str)
 
 Creates a new Bedrock client instance.
 
-The underlying `aiohttp.ClientSession` is created lazily when entering the
-async context via `async with`.
+The underlying `aiohttp.ClientSession` is created lazily when first used. You
+can interact with the client by using `async with` or by awaiting individual
+methods directly; both patterns will create a shared session automatically.
 
 - **region_name**: AWS region where Bedrock is available (e.g., "us-east-1", "us-west-2", "ap-southeast-1")
 
@@ -185,6 +187,9 @@ Invokes a Bedrock model and returns an asynchronous generator. The generator
 yields either parsed JSON objects or raw byte chunks depending on the payload.
 
 - Parameters are the same as `invoke_model`
+- Streaming error events from Bedrock raise `aiobedrock.main.BedrockStreamError`
+  and surface the error payload in the exception message so you can respond or
+  retry appropriately.
 
 #### close
 
@@ -209,6 +214,10 @@ The client provides detailed error messages for common Bedrock API errors:
 - 424: ModelErrorException
 - 408: ModelTimeoutException
 - 429: ThrottlingException
+
+In addition, when the streaming API surfaces an error event the library raises
+`BedrockStreamError` with the exception type that Bedrock reported (for
+example `ModelStreamError`) and the payload returned by the service.
 
 For more error details, refer to the [AWS Bedrock API documentation](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_InvokeModel.html).
 

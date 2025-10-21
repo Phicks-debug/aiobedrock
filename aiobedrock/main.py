@@ -13,6 +13,18 @@ from botocore.eventstream import EventStreamMessage, NoInitialResponseError
 
 from typing import AsyncGenerator, Dict, Any, Union
 
+
+class BedrockStreamError(Exception):
+    """Raised when the Bedrock event stream surfaces an error payload."""
+
+    def __init__(self, message_type: str, exception_type: str, detail: str):
+        self.message_type = message_type
+        self.exception_type = exception_type or "UnknownException"
+        self.detail = detail
+        super().__init__(
+            f"Bedrock stream error ({self.message_type}/{self.exception_type}): {self.detail}"
+        )
+
 log = logsim.CustomLogger()
 
 
@@ -90,9 +102,15 @@ class Client:
             log.info("Credentials expired or expiring soon, refreshing...")
             self._refresh_credentials()
 
-    async def __aenter__(self):
-        if self.session is None:
+    def _ensure_session(self) -> aiohttp.ClientSession:
+        """Create the shared aiohttp session on first use."""
+
+        if self.session is None or getattr(self.session, "closed", False):
             self.session = aiohttp.ClientSession(connector=self.connector)
+        return self.session
+
+    async def __aenter__(self):
+        self._ensure_session()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -118,7 +136,9 @@ class Client:
             **kwargs,
         )
 
-        async with self.session.post(
+        session = self._ensure_session()
+
+        async with session.post(
             url=url,
             headers=headers,
             data=body,
@@ -145,7 +165,9 @@ class Client:
             **kwargs,
         )
 
-        async with self.session.post(
+        session = self._ensure_session()
+
+        async with session.post(
             url=url,
             headers=headers,
             data=body,
@@ -290,15 +312,33 @@ class Client:
                 log.warning(f"Unexpected message type: {type(message)}")
                 return None
 
+            headers_dict = self._normalize_headers(headers)
+
+            message_type = headers_dict.get(":message-type")
+            exception_type = headers_dict.get(":exception-type")
+            event_type = headers_dict.get(":event-type")
+
+            if isinstance(payload, memoryview):
+                payload = payload.tobytes()
+            elif isinstance(payload, bytearray):
+                payload = bytes(payload)
+            elif hasattr(payload, "read"):
+                payload = payload.read()
+
             # Get content type from headers
             content_type = "application/json"  # Default
-            if hasattr(headers, "get"):
-                content_type_header = headers.get(":content-type")
-                if content_type_header and hasattr(
-                    content_type_header,
-                    "value",
-                ):
-                    content_type = content_type_header.value
+            content_type = headers_dict.get(":content-type", content_type)
+
+            if message_type in {"exception", "error"} or (
+                message_type == "event"
+                and event_type in {"error", "exception", "modelInvocationError"}
+            ):
+                detail = self._decode_payload_text(payload)
+                raise BedrockStreamError(
+                    message_type=message_type or "event",
+                    exception_type=exception_type or event_type or "UnknownException",
+                    detail=detail,
+                )
 
             if not payload:
                 return {}
@@ -306,12 +346,7 @@ class Client:
             # Handle JSON content
             if "application/json" in content_type:
                 try:
-                    if isinstance(payload, bytes):
-                        payload_str = payload.decode("utf-8")
-                    else:
-                        payload_str = str(payload)
-
-                    payload_data = orjson.loads(payload_str)
+                    payload_data = orjson.loads(self._ensure_text_payload(payload))
 
                     # Extract base64-encoded bytes if present
                     if "bytes" in payload_data:
@@ -335,6 +370,53 @@ class Client:
         except Exception as e:
             log.error(f"Error processing event message: {e}")
             return None
+
+    def _normalize_headers(self, headers) -> Dict[str, Any]:
+        """Convert botocore header objects into plain Python values."""
+
+        if headers is None:
+            return {}
+
+        if isinstance(headers, dict):
+            items = headers.items()
+        elif hasattr(headers, "items"):
+            items = headers.items()
+        else:
+            try:
+                items = list(headers)
+            except TypeError:
+                return {}
+
+        normalized: Dict[str, Any] = {}
+        for key, value in items:
+            if hasattr(value, "value"):
+                normalized[key] = value.value
+            else:
+                normalized[key] = value
+
+        return normalized
+
+    def _decode_payload_text(self, payload: Union[bytes, str]) -> str:
+        if isinstance(payload, bytes):
+            return payload.decode("utf-8", errors="replace")
+        if isinstance(payload, memoryview):
+            return payload.tobytes().decode("utf-8", errors="replace")
+        if isinstance(payload, bytearray):
+            return bytes(payload).decode("utf-8", errors="replace")
+        return str(payload)
+
+    def _ensure_text_payload(self, payload: Union[str, bytes]) -> str:
+        if isinstance(payload, str):
+            return payload
+        if isinstance(payload, bytes):
+            return payload.decode("utf-8")
+        if isinstance(payload, memoryview):
+            return payload.tobytes().decode("utf-8")
+        if isinstance(payload, bytearray):
+            return bytes(payload).decode("utf-8")
+        if hasattr(payload, "read"):
+            return self._ensure_text_payload(payload.read())
+        return str(payload)
 
     async def _handle_error_response(self, response: aiohttp.ClientResponse):
         """Handle HTTP error responses"""
