@@ -1,5 +1,5 @@
-import json
 import asyncio
+import json
 
 from aiobedrock import Client
 
@@ -35,7 +35,8 @@ async def main():
             contentType="application/json",
             trace="ENABLED_FULL",
         ):
-            print(chunk.decode("utf-8"))
+            if isinstance(chunk, bytes):
+                print(chunk.decode("utf-8"))
 
 
 if __name__ == "__main__":

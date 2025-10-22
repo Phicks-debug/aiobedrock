@@ -1,5 +1,5 @@
-import json
 import asyncio
+import json
 
 from aiobedrock import Client
 
@@ -32,13 +32,11 @@ async def main():
             contentType="application/json",
             trace="ENABLED_FULL",
         ):
-            c = json.loads(chunk)
-            if c.get("contentBlockDelta"):
-                print(
-                    c["contentBlockDelta"]["delta"]["text"],
-                    flush=True,
-                    end="",
-                )
+            if isinstance(chunk, bytes):
+                c = json.loads(chunk)
+                if c.get("contentBlockDelta"):
+                    content = c["contentBlockDelta"]["delta"]["text"]
+                    print(content, flush=True, end="")
 
 
 if __name__ == "__main__":

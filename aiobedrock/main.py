@@ -1,27 +1,72 @@
-import io
-import boto3
+import asyncio
 import base64
-import orjson
-import aiohttp
-import struct
-import logsim
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import (
+    Any,
+    AsyncGenerator,
+    Dict,
+    Iterable,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+    overload,
+)
 
-from botocore.awsrequest import AWSRequest
+import aiohttp
+import boto3
+import logsim
+import orjson
 from botocore.auth import SigV4Auth
-from botocore.eventstream import EventStreamMessage, NoInitialResponseError
+from botocore.awsrequest import AWSRequest
+from botocore.eventstream import EventStreamBuffer
 
-from typing import AsyncGenerator, Dict, Any, Union
+
+class BedrockStreamError(Exception):
+    """Raised when the Bedrock event stream surfaces an error payload."""
+
+    def __init__(self, message_type: str, exception_type: str, detail: str):
+        self.message_type = message_type
+        self.exception_type = exception_type or "UnknownException"
+        self.detail = detail
+        super().__init__(
+            f"Bedrock Error ({self.message_type}/{self.exception_type}): {self.detail}"  # noqa: E501
+        )
+
+
+class BedrockClientError(Exception):
+    """Raised when the Bedrock Invoke API returns a non-success HTTP."""
+
+    def __init__(self, status: int, error_type: str, detail: str):
+        self.status = status
+        self.error_type = error_type
+        self.detail = detail
+        super().__init__(f"{status} {error_type}: {detail}")
+
 
 log = logsim.CustomLogger()
 
 
 class Client:
-    def __init__(self, region_name: str, assume_role_arn: str = None):
+    def __init__(
+        self,
+        region_name: str,
+        assume_role_arn: Optional[str] = None,
+        *,
+        max_connections: int = 10000,
+        request_timeout: Optional[float] = None,
+        max_concurrency: Optional[int] = None,
+        max_retries: int = 2,
+        retry_backoff: float = 0.5,
+        max_backoff: float = 6.0,
+        retry_statuses: Optional[Sequence[int]] = None,
+    ):
         self.region_name = region_name
         self.assume_role_arn = assume_role_arn
         self.connector = aiohttp.TCPConnector(
-            limit=10000,
+            limit=max_connections,
             ttl_dns_cache=3600,
             use_dns_cache=True,
             enable_cleanup_closed=True,
@@ -31,11 +76,41 @@ class Client:
         self.access_key = None
         self.secret_key = None
         self.session_token = None
+        self.credentials = None
+
+        self._client_timeout = (
+            aiohttp.ClientTimeout(total=request_timeout) if request_timeout else None  # noqa: E501
+        )
+        self._max_concurrency = (
+            max_concurrency if max_concurrency and max_concurrency > 0 else None  # noqa: E501
+        )
+        self._max_retries = max(0, max_retries)
+        self._retry_backoff = max(0.0, retry_backoff)
+        self._retry_backoff_cap = (
+            max(max_backoff, self._retry_backoff)
+            if max_backoff > 0
+            else max(self._retry_backoff, 0.0)
+        )
+        self._retry_statuses = (
+            tuple(retry_statuses)
+            if retry_statuses
+            else (
+                408,
+                424,
+                429,
+                500,
+                502,
+                503,
+                504,
+            )
+        )
+        self._request_semaphore: Optional[asyncio.Semaphore] = None
+        self._credential_lock: Optional[asyncio.Lock] = None
 
         # Initialize credentials
-        self._refresh_credentials()
+        self._refresh_credentials_sync()
 
-    def _refresh_credentials(self):
+    def _refresh_credentials_sync(self):
         """Refresh AWS credentials, handling role assumption if needed"""
         if self.assume_role_arn:
             sts_client = boto3.client("sts")
@@ -66,6 +141,10 @@ class Client:
 
         self.credentials = boto3_session.get_credentials()
 
+    async def _refresh_credentials(self):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._refresh_credentials_sync)
+
     def _are_credentials_expired(self) -> bool:
         """Check if the current credentials are expired or about to expire"""
         if not self.assume_role_arn or not self.expiration:
@@ -82,17 +161,38 @@ class Client:
         time_until_expiration = expiration_time - current_time
         return time_until_expiration.total_seconds() < 300  # 5 minutes
 
-    def _ensure_valid_credentials(self):
+    async def _ensure_valid_credentials(self):
         """Ensure credentials are valid, refreshing if necessary"""
+        if self.credentials is None:
+            await self._refresh_credentials()
+            return
+
         if not self.assume_role_arn:
             return
-        if self._are_credentials_expired():
-            log.info("Credentials expired or expiring soon, refreshing...")
-            self._refresh_credentials()
+
+        if not self._are_credentials_expired():
+            return
+
+        if self._credential_lock is None:
+            self._credential_lock = asyncio.Lock()
+
+        async with self._credential_lock:
+            if self._are_credentials_expired():
+                log.info("Credentials expired or expiring soon, refreshing...")
+                await self._refresh_credentials()
+
+    def _ensure_session(self) -> aiohttp.ClientSession:
+        """Create the shared aiohttp session on first use."""
+
+        if self.session is None or getattr(self.session, "closed", False):
+            session_kwargs: Dict[str, Any] = {"connector": self.connector}
+            if self._client_timeout is not None:
+                session_kwargs["timeout"] = self._client_timeout
+            self.session = aiohttp.ClientSession(**session_kwargs)
+        return self.session
 
     async def __aenter__(self):
-        if self.session is None:
-            self.session = aiohttp.ClientSession(connector=self.connector)
+        self._ensure_session()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -103,174 +203,235 @@ class Client:
             await self.session.close()
             self.session = None
 
+    async def _acquire_request_slot(self) -> Optional[asyncio.Semaphore]:
+        if self._max_concurrency is None:
+            return None
+
+        if self._request_semaphore is None:
+            self._request_semaphore = asyncio.Semaphore(self._max_concurrency)
+
+        await self._request_semaphore.acquire()
+        return self._request_semaphore
+
+    @asynccontextmanager
+    async def _request(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        data: Union[str, bytes],
+    ):
+        limiter = await self._acquire_request_slot()
+        session = self._ensure_session()
+        post_kwargs: Dict[str, Any] = {
+            "url": url,
+            "headers": headers,
+            "data": data,
+        }
+        if self._client_timeout is not None:
+            post_kwargs["timeout"] = self._client_timeout
+
+        try:
+            async with session.post(**post_kwargs) as response:
+                yield response
+        finally:
+            if limiter is not None:
+                limiter.release()
+
+    def _should_retry(self, exc: Exception, attempt: int) -> bool:
+        if attempt >= self._max_retries:
+            return False
+
+        if isinstance(exc, BedrockClientError):
+            return exc.status in self._retry_statuses
+
+        if isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError)):
+            return True
+
+        return False
+
+    async def _sleep_backoff(self, attempt: int) -> None:
+        if self._retry_backoff <= 0:
+            if attempt > 0:
+                await asyncio.sleep(0)
+            return
+
+        delay = min(
+            self._retry_backoff * (2**attempt),
+            self._retry_backoff_cap,
+        )
+        if delay > 0:
+            await asyncio.sleep(delay)
+
     async def invoke_model(self, body: str, modelId: str, **kwargs) -> bytes:
         """Invoke a model and return the response body as bytes"""
-        # Ensure credentials are valid before making the request
-        self._ensure_valid_credentials()
-
         url = f"https://bedrock-runtime.{self.region_name}.amazonaws.com/model/{modelId}/invoke"  # noqa: E501
-        headers = self._signed_request(
-            body=body,
-            url=url,
-            method="POST",
-            credentials=self.credentials,
-            region_name=self.region_name,
-            **kwargs,
-        )
 
-        async with self.session.post(
-            url=url,
-            headers=headers,
-            data=body,
-        ) as res:
-            await self._handle_error_response(res)
-            return await res.read()
+        attempt = 0
+        while True:
+            await self._ensure_valid_credentials()
+            headers = self._signed_request(
+                body=body,
+                url=url,
+                method="POST",
+                credentials=self.credentials,
+                region_name=self.region_name,
+                **kwargs,
+            )
+
+            try:
+                async with self._request(url=url, headers=headers, data=body) as res:  # noqa: E501
+                    await self._handle_error_response(res)
+                    return await res.read()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not self._should_retry(exc, attempt):
+                    raise
+                await self._sleep_backoff(attempt)
+                attempt += 1
 
     async def invoke_model_with_response_stream(
         self, body: str, modelId: str, **kwargs
     ) -> AsyncGenerator[Union[Dict[str, Any], bytes], None]:
         """
-        Invoke a model with streaming response with memory management
+        Invoke a model with streaming response
         """
-        # Ensure credentials are valid before making the request
-        self._ensure_valid_credentials()
-
         url = f"https://bedrock-runtime.{self.region_name}.amazonaws.com/model/{modelId}/invoke-with-response-stream"  # noqa: E501
-        headers = self._signed_request(
-            body=body,
-            url=url,
-            method="POST",
-            credentials=self.credentials,
-            region_name=self.region_name,
-            **kwargs,
-        )
+        attempt = 0
+        emitted = False
 
-        async with self.session.post(
-            url=url,
-            headers=headers,
-            data=body,
-        ) as res:
-            await self._handle_error_response(res)
-
-            # Process the stream using botocore's EventStreamMessage
-            message_buffer = b""
-
-            async for chunk in res.content.iter_chunked(8192):
-                message_buffer += chunk
-
-                # Parse complete messages from the buffer
-                while True:
-                    try:
-                        # Try to parse a message from the current buffer
-                        message, consumed = self._parse_event_stream_message(
-                            message_buffer
-                        )
-
-                        if message is None:
-                            # Not enough data for a complete message
-                            break
-
-                        # Remove consumed bytes from buffer
-                        message_buffer = message_buffer[consumed:]
-
-                        # Process the parsed message
-                        processed_content = self._process_event_message(
-                            message,
-                        )
-                        if processed_content is not None:
-                            yield processed_content
-
-                    except Exception as e:
-                        log.error(
-                            f"Error parsing event stream message: {e}"
-                        )  # noqa:E501
-                        # Try to recover by discarding some data
-                        if len(message_buffer) > 1024:
-                            message_buffer = message_buffer[512:]
-                        else:
-                            break
-
-            # Process any remaining complete messages in the buffer
-            while message_buffer:
-                try:
-                    message, consumed = self._parse_event_stream_message(
-                        message_buffer,
-                    )
-                    if message is None or consumed == 0:
-                        break
-
-                    message_buffer = message_buffer[consumed:]
-                    processed_content = self._process_event_message(message)
-                    if processed_content is not None:
-                        yield processed_content
-
-                except Exception as e:
-                    log.error(f"Error processing remaining buffer: {e}")
-                    break
-
-    def _parse_event_stream_message(
-        self, buffer: bytes
-    ) -> tuple[EventStreamMessage, int]:
-        """
-        Parse an EventStreamMessage from the buffer using botocore's parser
-        """
-        if len(buffer) < 12:  # Minimum message size (prelude)
-            return None, 0
-
-        try:
-            # Use botocore's EventStreamMessage to parse
-            # Create a BytesIO stream for the message parser
-            stream = io.BytesIO(buffer)
+        while True:
+            await self._ensure_valid_credentials()
+            headers = self._signed_request(
+                body=body,
+                url=url,
+                method="POST",
+                credentials=self.credentials,
+                region_name=self.region_name,
+                **kwargs,
+            )
 
             try:
-                message = EventStreamMessage.from_response_dict(
-                    {"body": stream},
-                    None,
-                )
+                async with self._request(url=url, headers=headers, data=body) as res:  # noqa: E501
+                    await self._handle_error_response(res)
 
-                # Calculate how many bytes were consumed
-                consumed = stream.tell()
-                return message, consumed
+                    event_stream_buffer = EventStreamBuffer()
 
-            except NoInitialResponseError:
-                return None, 0
-            except Exception:
-                # Try the manual approach as fallback
-                return self._manual_parse_message(buffer)
+                    async for chunk in res.content.iter_chunked(8192):
+                        event_stream_buffer.add_data(chunk)
 
-        except Exception as e:
-            log.error(f"Failed to parse event stream message: {e}")
-            return None, 0
+                        while True:
+                            try:
+                                message = event_stream_buffer.next()
+                                processed_content = self._process_event_message(  # noqa: E501
+                                    message=message,
+                                )
+                                if processed_content is not None:
+                                    emitted = True
+                                    yield processed_content
+                            except StopIteration:
+                                break
+                            except Exception as e:
+                                log.error(f"Error processing event: {e}")
+                                break
 
-    def _manual_parse_message(
+                    while True:
+                        try:
+                            message = event_stream_buffer.next()
+                            processed_content = self._process_event_message(
+                                message,
+                            )
+                            if processed_content is not None:
+                                emitted = True
+                                yield processed_content
+                        except StopIteration:
+                            return
+                        except Exception as e:
+                            log.error(f"Error processing buffer: {e}")
+                            return
+            except asyncio.CancelledError:
+                raise
+            except BedrockStreamError:
+                raise
+            except Exception as exc:
+                if emitted or not self._should_retry(exc, attempt):
+                    raise
+                await self._sleep_backoff(attempt)
+                attempt += 1
+
+    @overload
+    async def invoke_many(
         self,
-        buffer: bytes,
-    ) -> tuple[Dict[str, Any], int]:
-        """Fallback manual parsing when botocore parsing fails"""
-        if len(buffer) < 12:
-            return None, 0
+        requests: Iterable[Mapping[str, Any]],
+        *,
+        concurrency: Optional[int] = None,
+        return_exceptions: Literal[False] = False,
+    ) -> Sequence[bytes]: ...
 
+    @overload
+    async def invoke_many(
+        self,
+        requests: Iterable[Mapping[str, Any]],
+        *,
+        concurrency: Optional[int] = None,
+        return_exceptions: Literal[True],
+    ) -> Sequence[Union[bytes, BaseException]]: ...
+
+    async def invoke_many(
+        self,
+        requests: Iterable[Mapping[str, Any]],
+        *,
+        concurrency: Optional[int] = None,
+        return_exceptions: bool = False,
+    ) -> Sequence[Union[bytes, BaseException]]:
+        """Invoke multiple requests concurrently."""
+
+        request_list = list(requests)
+        if not request_list:
+            return []
+
+        limiter: Optional[asyncio.Semaphore] = None
+        if concurrency and concurrency > 0:
+            limiter = asyncio.Semaphore(concurrency)
+
+        async def _invoke(entry: Mapping[str, Any]) -> bytes:
+            if "body" not in entry or "modelId" not in entry:
+                raise ValueError("Each request must include 'body' and 'modelId' keys")  # noqa: E501
+
+            body_value = entry["body"]
+            model_id = entry["modelId"]
+            extra = {
+                key: value
+                for key, value in entry.items()
+                if key not in {"body", "modelId"}
+            }
+
+            if limiter is not None:
+                async with limiter:
+                    return await self.invoke_model(
+                        body=body_value, modelId=model_id, **extra
+                    )
+
+            return await self.invoke_model(
+                body=body_value,
+                modelId=model_id,
+                **extra,
+            )
+
+        tasks = [asyncio.create_task(_invoke(item)) for item in request_list]
         try:
-            # Parse the prelude
-            total_length = struct.unpack(">I", buffer[0:4])[0]
-            headers_length = struct.unpack(">I", buffer[4:8])[0]
+            if return_exceptions:
+                gathered = await asyncio.gather(*tasks, return_exceptions=True)
+                results: Sequence[Union[bytes, BaseException]] = tuple(gathered)  # noqa: E501
+            else:
+                gathered = await asyncio.gather(*tasks, return_exceptions=False)  # noqa: E501
+                results = tuple(gathered)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
 
-            if len(buffer) < total_length:
-                return None, 0
-
-            # Extract the payload (skip prelude, headers, and trailing CRC)
-            payload_start = 12 + headers_length
-            payload_end = total_length - 4
-            payload = buffer[payload_start:payload_end]
-
-            # Create a simple message structure
-            message = {"headers": {}, "payload": payload}
-
-            return message, total_length
-
-        except Exception as e:
-            log.error(f"Manual parsing failed: {e}")
-            return None, 0
+        return results
 
     def _process_event_message(
         self,
@@ -290,15 +451,36 @@ class Client:
                 log.warning(f"Unexpected message type: {type(message)}")
                 return None
 
+            headers_dict = self._normalize_headers(headers)
+
+            message_type = headers_dict.get(":message-type")
+            exception_type = headers_dict.get(":exception-type")
+            event_type = headers_dict.get(":event-type")
+
+            if isinstance(payload, memoryview):
+                payload = payload.tobytes()
+            elif isinstance(payload, bytearray):
+                payload = bytes(payload)
+
             # Get content type from headers
             content_type = "application/json"  # Default
-            if hasattr(headers, "get"):
-                content_type_header = headers.get(":content-type")
-                if content_type_header and hasattr(
-                    content_type_header,
-                    "value",
-                ):
-                    content_type = content_type_header.value
+            content_type = headers_dict.get(":content-type", content_type)
+
+            if message_type in {"exception", "error"} or (
+                message_type == "event"
+                and event_type
+                in {
+                    "error",
+                    "exception",
+                    "modelInvocationError",
+                }
+            ):
+                detail = self._decode_payload_text(payload)
+                raise BedrockStreamError(
+                    message_type=message_type or "event",
+                    exception_type=exception_type or event_type or "UnknownException",  # noqa: E501
+                    detail=detail,
+                )
 
             if not payload:
                 return {}
@@ -306,12 +488,11 @@ class Client:
             # Handle JSON content
             if "application/json" in content_type:
                 try:
-                    if isinstance(payload, bytes):
-                        payload_str = payload.decode("utf-8")
-                    else:
-                        payload_str = str(payload)
-
-                    payload_data = orjson.loads(payload_str)
+                    payload_data = orjson.loads(
+                        self._ensure_text_payload(
+                            payload=payload,
+                        )
+                    )
 
                     # Extract base64-encoded bytes if present
                     if "bytes" in payload_data:
@@ -336,6 +517,53 @@ class Client:
             log.error(f"Error processing event message: {e}")
             return None
 
+    def _normalize_headers(self, headers) -> Dict[str, Any]:
+        """Convert botocore header objects into plain Python values."""
+
+        if headers is None:
+            return {}
+
+        if isinstance(headers, dict):
+            items = headers.items()
+        elif hasattr(headers, "items"):
+            items = headers.items()
+        else:
+            try:
+                items = list(headers)
+            except TypeError:
+                return {}
+
+        normalized: Dict[str, Any] = {}
+        for key, value in items:
+            if hasattr(value, "value"):
+                normalized[key] = value.value
+            else:
+                normalized[key] = value
+
+        return normalized
+
+    def _decode_payload_text(self, payload: Union[bytes, str]) -> str:
+        if isinstance(payload, bytes):
+            return payload.decode("utf-8", errors="replace")
+        if isinstance(payload, memoryview):
+            return payload.tobytes().decode("utf-8", errors="replace")
+        if isinstance(payload, bytearray):
+            return bytes(payload).decode("utf-8", errors="replace")
+        return str(payload)
+
+    def _ensure_text_payload(self, payload: Union[str, bytes]) -> str:
+        if isinstance(payload, str):
+            return payload
+        if isinstance(payload, bytes):
+            return payload.decode("utf-8")
+        if isinstance(payload, memoryview):
+            return payload.tobytes().decode("utf-8")
+        if isinstance(payload, bytearray):
+            return bytes(payload).decode("utf-8")
+        if hasattr(payload, "read"):
+            return self._ensure_text_payload(payload.read())
+        return str(payload)
+
     async def _handle_error_response(self, response: aiohttp.ClientResponse):
         """Handle HTTP error responses"""
         if response.status == 200:
@@ -351,7 +579,7 @@ class Client:
         }
 
         error_type = error_map.get(response.status, "UnknownException")
-        raise Exception(f"{response.status} {error_type}: {error_text}")
+        raise BedrockClientError(response.status, error_type, error_text)
 
     def _signed_request(
         self,
@@ -363,6 +591,12 @@ class Client:
         **kwargs,
     ) -> Dict[str, str]:
         """Create a signed AWS request"""
+        if credentials is None:
+            raise RuntimeError("AWS credentials are not initialized")
+
+        if hasattr(credentials, "get_frozen_credentials"):
+            credentials = credentials.get_frozen_credentials()
+
         request = AWSRequest(method=method, url=url, data=body)
         request.headers.add_header("Host", url.split("/")[2])
 
@@ -402,7 +636,10 @@ class Client:
 
         for kwarg_key, header_name in optional_headers:
             if kwargs.get(kwarg_key):
-                request.headers.add_header(header_name, kwargs.get(kwarg_key))
+                request.headers.add_header(
+                    header_name,
+                    kwargs.get(kwarg_key),  # type: ignore
+                )
 
         # Sign the request
         SigV4Auth(credentials, "bedrock", region_name).add_auth(request)
