@@ -1,7 +1,7 @@
 import asyncio
 import base64
-from pathlib import Path
 import sys
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -128,7 +128,11 @@ def test_invoke_sagemaker_endpoint_builds_headers():
     assert signed_kwargs["service"] == "sagemaker"
     assert signed_kwargs["accept"] == "application/json"
     assert signed_kwargs["contentType"] == "application/json"
-    assert signed_kwargs["extra_headers"]["X-Amzn-SageMaker-Custom-Attributes"] == "attr"
-    assert signed_kwargs["extra_headers"]["X-Amzn-SageMaker-Target-Variant"] == "variant"
+    assert (
+        signed_kwargs["extra_headers"]["X-Amzn-SageMaker-Custom-Attributes"] == "attr"
+    )
+    assert (
+        signed_kwargs["extra_headers"]["X-Amzn-SageMaker-Target-Variant"] == "variant"
+    )
     assert signed_kwargs["extra_headers"]["X-Custom"] == "value"
     assert captured["request"]["url"].endswith("/endpoints/demo-endpoint/invocations")
