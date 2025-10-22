@@ -1,17 +1,14 @@
-import io
-import boto3
 import base64
-import orjson
-import aiohttp
-import struct
-import logsim
 from datetime import datetime, timezone
+from typing import Any, AsyncGenerator, Dict, Optional, Union
 
-from botocore.awsrequest import AWSRequest
+import aiohttp
+import boto3
+import logsim
+import orjson
 from botocore.auth import SigV4Auth
-from botocore.eventstream import EventStreamMessage, NoInitialResponseError
-
-from typing import AsyncGenerator, Dict, Any, Union
+from botocore.awsrequest import AWSRequest
+from botocore.eventstream import EventStreamBuffer
 
 
 class BedrockStreamError(Exception):
@@ -22,14 +19,19 @@ class BedrockStreamError(Exception):
         self.exception_type = exception_type or "UnknownException"
         self.detail = detail
         super().__init__(
-            f"Bedrock stream error ({self.message_type}/{self.exception_type}): {self.detail}"
+            f"Bedrock Error ({self.message_type}/{self.exception_type}): {self.detail}"  # noqa: E501
         )
+
 
 log = logsim.CustomLogger()
 
 
 class Client:
-    def __init__(self, region_name: str, assume_role_arn: str = None):
+    def __init__(
+        self,
+        region_name: str,
+        assume_role_arn: Optional[str] = None,
+    ):
         self.region_name = region_name
         self.assume_role_arn = assume_role_arn
         self.connector = aiohttp.TCPConnector(
@@ -150,7 +152,7 @@ class Client:
         self, body: str, modelId: str, **kwargs
     ) -> AsyncGenerator[Union[Dict[str, Any], bytes], None]:
         """
-        Invoke a model with streaming response with memory management
+        Invoke a model with streaming response
         """
         # Ensure credentials are valid before making the request
         self._ensure_valid_credentials()
@@ -174,125 +176,46 @@ class Client:
         ) as res:
             await self._handle_error_response(res)
 
-            # Process the stream using botocore's EventStreamMessage
-            message_buffer = b""
+            # Use botocore's EventStreamBuffer for proper event stream parsing
+            event_stream_buffer = EventStreamBuffer()
 
             async for chunk in res.content.iter_chunked(8192):
-                message_buffer += chunk
+                # Add raw bytes to the buffer
+                event_stream_buffer.add_data(chunk)
 
-                # Parse complete messages from the buffer
+                # Extract and process all complete messages from the buffer
                 while True:
                     try:
-                        # Try to parse a message from the current buffer
-                        message, consumed = self._parse_event_stream_message(
-                            message_buffer
-                        )
-
-                        if message is None:
-                            # Not enough data for a complete message
-                            break
-
-                        # Remove consumed bytes from buffer
-                        message_buffer = message_buffer[consumed:]
+                        # Get the next complete message from the buffer
+                        message = event_stream_buffer.next()
 
                         # Process the parsed message
                         processed_content = self._process_event_message(
-                            message,
+                            message=message,
                         )
                         if processed_content is not None:
                             yield processed_content
 
+                    except StopIteration:
+                        # No more complete messages available, wait for data
+                        break
                     except Exception as e:
-                        log.error(
-                            f"Error parsing event stream message: {e}"
-                        )  # noqa:E501
-                        # Try to recover by discarding some data
-                        if len(message_buffer) > 1024:
-                            message_buffer = message_buffer[512:]
-                        else:
-                            break
-
-            # Process any remaining complete messages in the buffer
-            while message_buffer:
-                try:
-                    message, consumed = self._parse_event_stream_message(
-                        message_buffer,
-                    )
-                    if message is None or consumed == 0:
+                        log.error(f"Error processing event stream: {e}")
                         break
 
-                    message_buffer = message_buffer[consumed:]
+            # Process any remaining complete messages in the buffer
+            while True:
+                try:
+                    message = event_stream_buffer.next()
                     processed_content = self._process_event_message(message)
                     if processed_content is not None:
                         yield processed_content
-
+                except StopIteration:
+                    # All messages processed
+                    break
                 except Exception as e:
                     log.error(f"Error processing remaining buffer: {e}")
                     break
-
-    def _parse_event_stream_message(
-        self, buffer: bytes
-    ) -> tuple[EventStreamMessage, int]:
-        """
-        Parse an EventStreamMessage from the buffer using botocore's parser
-        """
-        if len(buffer) < 12:  # Minimum message size (prelude)
-            return None, 0
-
-        try:
-            # Use botocore's EventStreamMessage to parse
-            # Create a BytesIO stream for the message parser
-            stream = io.BytesIO(buffer)
-
-            try:
-                message = EventStreamMessage.from_response_dict(
-                    {"body": stream},
-                    None,
-                )
-
-                # Calculate how many bytes were consumed
-                consumed = stream.tell()
-                return message, consumed
-
-            except NoInitialResponseError:
-                return None, 0
-            except Exception:
-                # Try the manual approach as fallback
-                return self._manual_parse_message(buffer)
-
-        except Exception as e:
-            log.error(f"Failed to parse event stream message: {e}")
-            return None, 0
-
-    def _manual_parse_message(
-        self,
-        buffer: bytes,
-    ) -> tuple[Dict[str, Any], int]:
-        """Fallback manual parsing when botocore parsing fails"""
-        if len(buffer) < 12:
-            return None, 0
-
-        try:
-            # Parse the prelude
-            total_length = struct.unpack(">I", buffer[0:4])[0]
-            headers_length = struct.unpack(">I", buffer[4:8])[0]
-
-            if len(buffer) < total_length:
-                return None, 0
-
-            # Extract the payload (skip prelude, headers, and trailing CRC)
-            payload_start = 12 + headers_length
-            payload_end = total_length - 4
-            payload = buffer[payload_start:payload_end]
-
-            # Create a simple message structure
-            message = {"headers": {}, "payload": payload}
-
-            return message, total_length
-
-        except Exception as e:
-            log.error(f"Manual parsing failed: {e}")
-            return None, 0
 
     def _process_event_message(
         self,
@@ -322,8 +245,6 @@ class Client:
                 payload = payload.tobytes()
             elif isinstance(payload, bytearray):
                 payload = bytes(payload)
-            elif hasattr(payload, "read"):
-                payload = payload.read()
 
             # Get content type from headers
             content_type = "application/json"  # Default
@@ -331,12 +252,17 @@ class Client:
 
             if message_type in {"exception", "error"} or (
                 message_type == "event"
-                and event_type in {"error", "exception", "modelInvocationError"}
+                and event_type
+                in {
+                    "error",
+                    "exception",
+                    "modelInvocationError",
+                }
             ):
                 detail = self._decode_payload_text(payload)
                 raise BedrockStreamError(
                     message_type=message_type or "event",
-                    exception_type=exception_type or event_type or "UnknownException",
+                    exception_type=exception_type or event_type or "UnknownException",  # noqa: E501
                     detail=detail,
                 )
 
@@ -346,7 +272,11 @@ class Client:
             # Handle JSON content
             if "application/json" in content_type:
                 try:
-                    payload_data = orjson.loads(self._ensure_text_payload(payload))
+                    payload_data = orjson.loads(
+                        self._ensure_text_payload(
+                            payload=payload,
+                        )
+                    )
 
                     # Extract base64-encoded bytes if present
                     if "bytes" in payload_data:
@@ -484,7 +414,10 @@ class Client:
 
         for kwarg_key, header_name in optional_headers:
             if kwargs.get(kwarg_key):
-                request.headers.add_header(header_name, kwargs.get(kwarg_key))
+                request.headers.add_header(
+                    header_name,
+                    kwargs.get(kwarg_key),  # type: ignore
+                )
 
         # Sign the request
         SigV4Auth(credentials, "bedrock", region_name).add_auth(request)
