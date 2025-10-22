@@ -14,6 +14,7 @@ from typing import (
     Union,
     overload,
 )
+from urllib.parse import urlparse
 
 import aiohttp
 import boto3
@@ -280,6 +281,90 @@ class Client:
 
             try:
                 async with self._request(url=url, headers=headers, data=body) as res:  # noqa: E501
+                    await self._handle_error_response(res)
+                    return await res.read()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not self._should_retry(exc, attempt):
+                    raise
+                await self._sleep_backoff(attempt)
+                attempt += 1
+
+    async def invoke_sagemaker_endpoint(
+        self,
+        endpoint_name: str,
+        *,
+        body: Union[str, bytes],
+        content_type: Optional[str] = None,
+        accept: Optional[str] = None,
+        custom_attributes: Optional[str] = None,
+        target_variant: Optional[str] = None,
+        target_model: Optional[str] = None,
+        target_container_hostname: Optional[str] = None,
+        target_channel: Optional[str] = None,
+        inference_component: Optional[str] = None,
+        inference_id: Optional[str] = None,
+        endpoint_config_name: Optional[str] = None,
+        invocation_timeout_seconds: Optional[int] = None,
+        headers: Optional[Mapping[str, str]] = None,
+    ) -> bytes:
+        """Invoke a SageMaker endpoint asynchronously."""
+
+        url = (
+            f"https://runtime.sagemaker.{self.region_name}.amazonaws.com"
+            f"/endpoints/{endpoint_name}/invocations"
+        )
+
+        attempt = 0
+        while True:
+            await self._ensure_valid_credentials()
+
+            extra_headers: Dict[str, str] = {}
+
+            header_mappings = {
+                "X-Amzn-SageMaker-Custom-Attributes": custom_attributes,
+                "X-Amzn-SageMaker-Target-Variant": target_variant,
+                "X-Amzn-SageMaker-Target-Model": target_model,
+                "X-Amzn-SageMaker-Target-Container-Hostname": target_container_hostname,  # noqa: E501
+                "X-Amzn-SageMaker-Target-Channel": target_channel,
+                "X-Amzn-SageMaker-Inference-Components": inference_component,
+                "X-Amzn-SageMaker-Inference-Id": inference_id,
+                "X-Amzn-SageMaker-Endpoint-Config-Name": endpoint_config_name,
+                "X-Amzn-SageMaker-Invocation-Timeout-Seconds": (
+                    str(invocation_timeout_seconds)
+                    if invocation_timeout_seconds is not None
+                    else None
+                ),
+            }
+
+            for key, value in header_mappings.items():
+                if value is not None:
+                    extra_headers[key] = value
+
+            if headers:
+                for key, value in headers.items():
+                    if value is not None:
+                        extra_headers[key] = value
+
+            signed_headers = self._signed_request(
+                body=body,
+                url=url,
+                method="POST",
+                credentials=self.credentials,
+                region_name=self.region_name,
+                service="sagemaker",
+                accept=accept,
+                contentType=content_type,
+                extra_headers=extra_headers if extra_headers else None,
+            )
+
+            try:
+                async with self._request(
+                    url=url,
+                    headers=signed_headers,
+                    data=body,
+                ) as res:
                     await self._handle_error_response(res)
                     return await res.read()
             except asyncio.CancelledError:
@@ -586,8 +671,11 @@ class Client:
         credentials,
         url: str,
         method: str,
-        body: str,
+        body: Union[str, bytes],
         region_name: str,
+        *,
+        service: str = "bedrock",
+        extra_headers: Optional[Mapping[str, str]] = None,
         **kwargs,
     ) -> Dict[str, str]:
         """Create a signed AWS request"""
@@ -598,49 +686,64 @@ class Client:
             credentials = credentials.get_frozen_credentials()
 
         request = AWSRequest(method=method, url=url, data=body)
-        request.headers.add_header("Host", url.split("/")[2])
+        request.headers.add_header("Host", urlparse(url).netloc)
 
-        # Set appropriate headers based on the endpoint
-        if "invoke-with-response-stream" in url:
-            request.headers.add_header(
-                "Accept",
-                "application/vnd.amazon.eventstream",
-            )
-        else:
-            request.headers.add_header(
-                "Accept", kwargs.get("accept", "application/json")
-            )
+        accept_header = kwargs.get("accept")
+        content_type = kwargs.get("contentType")
 
-        request.headers.add_header(
-            "Content-Type", kwargs.get("contentType", "application/json")
-        )
-        request.headers.add_header(
-            "X-Amzn-Bedrock-Trace", kwargs.get("trace", "DISABLED")
-        )
-
-        # Optional headers
-        optional_headers = [
-            (
-                "guardrailIdentifier",
-                "X-Amzn-Bedrock-GuardrailIdentifier",
-            ),
-            (
-                "guardrailVersion",
-                "X-Amzn-Bedrock-GuardrailVersion",
-            ),
-            (
-                "performanceConfigLatency",
-                "X-Amzn-Bedrock-PerformanceConfig-Latency",
-            ),
-        ]
-
-        for kwarg_key, header_name in optional_headers:
-            if kwargs.get(kwarg_key):
+        if service == "bedrock":
+            # Set appropriate headers based on the endpoint
+            if "invoke-with-response-stream" in url:
                 request.headers.add_header(
-                    header_name,
-                    kwargs.get(kwarg_key),  # type: ignore
+                    "Accept",
+                    "application/vnd.amazon.eventstream",
+                )
+            else:
+                request.headers.add_header(
+                    "Accept", accept_header or "application/json"
                 )
 
+            request.headers.add_header(
+                "Content-Type", content_type or "application/json"
+            )
+            request.headers.add_header(
+                "X-Amzn-Bedrock-Trace", kwargs.get("trace", "DISABLED")
+            )
+
+            # Optional headers specific to Bedrock
+            optional_headers = [
+                (
+                    "guardrailIdentifier",
+                    "X-Amzn-Bedrock-GuardrailIdentifier",
+                ),
+                (
+                    "guardrailVersion",
+                    "X-Amzn-Bedrock-GuardrailVersion",
+                ),
+                (
+                    "performanceConfigLatency",
+                    "X-Amzn-Bedrock-PerformanceConfig-Latency",
+                ),
+            ]
+
+            for kwarg_key, header_name in optional_headers:
+                value = kwargs.get(kwarg_key)
+                if value:
+                    request.headers.add_header(
+                        header_name,
+                        value,
+                    )
+        else:
+            if accept_header is not None:
+                request.headers.add_header("Accept", accept_header)
+            if content_type is not None:
+                request.headers.add_header("Content-Type", content_type)
+
+        if extra_headers:
+            for key, value in extra_headers.items():
+                if value is not None:
+                    request.headers.add_header(key, value)
+
         # Sign the request
-        SigV4Auth(credentials, "bedrock", region_name).add_auth(request)
+        SigV4Auth(credentials, service, region_name).add_auth(request)
         return dict(request.headers)
