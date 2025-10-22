@@ -1,6 +1,19 @@
+import asyncio
 import base64
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, AsyncGenerator, Dict, Optional, Union
+from typing import (
+    Any,
+    AsyncGenerator,
+    Dict,
+    Iterable,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+    overload,
+)
 
 import aiohttp
 import boto3
@@ -23,6 +36,16 @@ class BedrockStreamError(Exception):
         )
 
 
+class BedrockClientError(Exception):
+    """Raised when the Bedrock Invoke API returns a non-success HTTP."""
+
+    def __init__(self, status: int, error_type: str, detail: str):
+        self.status = status
+        self.error_type = error_type
+        self.detail = detail
+        super().__init__(f"{status} {error_type}: {detail}")
+
+
 log = logsim.CustomLogger()
 
 
@@ -31,11 +54,19 @@ class Client:
         self,
         region_name: str,
         assume_role_arn: Optional[str] = None,
+        *,
+        max_connections: int = 10000,
+        request_timeout: Optional[float] = None,
+        max_concurrency: Optional[int] = None,
+        max_retries: int = 2,
+        retry_backoff: float = 0.5,
+        max_backoff: float = 6.0,
+        retry_statuses: Optional[Sequence[int]] = None,
     ):
         self.region_name = region_name
         self.assume_role_arn = assume_role_arn
         self.connector = aiohttp.TCPConnector(
-            limit=10000,
+            limit=max_connections,
             ttl_dns_cache=3600,
             use_dns_cache=True,
             enable_cleanup_closed=True,
@@ -45,11 +76,41 @@ class Client:
         self.access_key = None
         self.secret_key = None
         self.session_token = None
+        self.credentials = None
+
+        self._client_timeout = (
+            aiohttp.ClientTimeout(total=request_timeout) if request_timeout else None  # noqa: E501
+        )
+        self._max_concurrency = (
+            max_concurrency if max_concurrency and max_concurrency > 0 else None  # noqa: E501
+        )
+        self._max_retries = max(0, max_retries)
+        self._retry_backoff = max(0.0, retry_backoff)
+        self._retry_backoff_cap = (
+            max(max_backoff, self._retry_backoff)
+            if max_backoff > 0
+            else max(self._retry_backoff, 0.0)
+        )
+        self._retry_statuses = (
+            tuple(retry_statuses)
+            if retry_statuses
+            else (
+                408,
+                424,
+                429,
+                500,
+                502,
+                503,
+                504,
+            )
+        )
+        self._request_semaphore: Optional[asyncio.Semaphore] = None
+        self._credential_lock: Optional[asyncio.Lock] = None
 
         # Initialize credentials
-        self._refresh_credentials()
+        self._refresh_credentials_sync()
 
-    def _refresh_credentials(self):
+    def _refresh_credentials_sync(self):
         """Refresh AWS credentials, handling role assumption if needed"""
         if self.assume_role_arn:
             sts_client = boto3.client("sts")
@@ -80,6 +141,10 @@ class Client:
 
         self.credentials = boto3_session.get_credentials()
 
+    async def _refresh_credentials(self):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._refresh_credentials_sync)
+
     def _are_credentials_expired(self) -> bool:
         """Check if the current credentials are expired or about to expire"""
         if not self.assume_role_arn or not self.expiration:
@@ -96,19 +161,34 @@ class Client:
         time_until_expiration = expiration_time - current_time
         return time_until_expiration.total_seconds() < 300  # 5 minutes
 
-    def _ensure_valid_credentials(self):
+    async def _ensure_valid_credentials(self):
         """Ensure credentials are valid, refreshing if necessary"""
+        if self.credentials is None:
+            await self._refresh_credentials()
+            return
+
         if not self.assume_role_arn:
             return
-        if self._are_credentials_expired():
-            log.info("Credentials expired or expiring soon, refreshing...")
-            self._refresh_credentials()
+
+        if not self._are_credentials_expired():
+            return
+
+        if self._credential_lock is None:
+            self._credential_lock = asyncio.Lock()
+
+        async with self._credential_lock:
+            if self._are_credentials_expired():
+                log.info("Credentials expired or expiring soon, refreshing...")
+                await self._refresh_credentials()
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         """Create the shared aiohttp session on first use."""
 
         if self.session is None or getattr(self.session, "closed", False):
-            self.session = aiohttp.ClientSession(connector=self.connector)
+            session_kwargs: Dict[str, Any] = {"connector": self.connector}
+            if self._client_timeout is not None:
+                session_kwargs["timeout"] = self._client_timeout
+            self.session = aiohttp.ClientSession(**session_kwargs)
         return self.session
 
     async def __aenter__(self):
@@ -123,30 +203,92 @@ class Client:
             await self.session.close()
             self.session = None
 
+    async def _acquire_request_slot(self) -> Optional[asyncio.Semaphore]:
+        if self._max_concurrency is None:
+            return None
+
+        if self._request_semaphore is None:
+            self._request_semaphore = asyncio.Semaphore(self._max_concurrency)
+
+        await self._request_semaphore.acquire()
+        return self._request_semaphore
+
+    @asynccontextmanager
+    async def _request(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        data: Union[str, bytes],
+    ):
+        limiter = await self._acquire_request_slot()
+        session = self._ensure_session()
+        post_kwargs: Dict[str, Any] = {
+            "url": url,
+            "headers": headers,
+            "data": data,
+        }
+        if self._client_timeout is not None:
+            post_kwargs["timeout"] = self._client_timeout
+
+        try:
+            async with session.post(**post_kwargs) as response:
+                yield response
+        finally:
+            if limiter is not None:
+                limiter.release()
+
+    def _should_retry(self, exc: Exception, attempt: int) -> bool:
+        if attempt >= self._max_retries:
+            return False
+
+        if isinstance(exc, BedrockClientError):
+            return exc.status in self._retry_statuses
+
+        if isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError)):
+            return True
+
+        return False
+
+    async def _sleep_backoff(self, attempt: int) -> None:
+        if self._retry_backoff <= 0:
+            if attempt > 0:
+                await asyncio.sleep(0)
+            return
+
+        delay = min(
+            self._retry_backoff * (2**attempt),
+            self._retry_backoff_cap,
+        )
+        if delay > 0:
+            await asyncio.sleep(delay)
+
     async def invoke_model(self, body: str, modelId: str, **kwargs) -> bytes:
         """Invoke a model and return the response body as bytes"""
-        # Ensure credentials are valid before making the request
-        self._ensure_valid_credentials()
-
         url = f"https://bedrock-runtime.{self.region_name}.amazonaws.com/model/{modelId}/invoke"  # noqa: E501
-        headers = self._signed_request(
-            body=body,
-            url=url,
-            method="POST",
-            credentials=self.credentials,
-            region_name=self.region_name,
-            **kwargs,
-        )
 
-        session = self._ensure_session()
+        attempt = 0
+        while True:
+            await self._ensure_valid_credentials()
+            headers = self._signed_request(
+                body=body,
+                url=url,
+                method="POST",
+                credentials=self.credentials,
+                region_name=self.region_name,
+                **kwargs,
+            )
 
-        async with session.post(
-            url=url,
-            headers=headers,
-            data=body,
-        ) as res:
-            await self._handle_error_response(res)
-            return await res.read()
+            try:
+                async with self._request(url=url, headers=headers, data=body) as res:  # noqa: E501
+                    await self._handle_error_response(res)
+                    return await res.read()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not self._should_retry(exc, attempt):
+                    raise
+                await self._sleep_backoff(attempt)
+                attempt += 1
 
     async def invoke_model_with_response_stream(
         self, body: str, modelId: str, **kwargs
@@ -154,68 +296,142 @@ class Client:
         """
         Invoke a model with streaming response
         """
-        # Ensure credentials are valid before making the request
-        self._ensure_valid_credentials()
-
         url = f"https://bedrock-runtime.{self.region_name}.amazonaws.com/model/{modelId}/invoke-with-response-stream"  # noqa: E501
-        headers = self._signed_request(
-            body=body,
-            url=url,
-            method="POST",
-            credentials=self.credentials,
-            region_name=self.region_name,
-            **kwargs,
-        )
+        attempt = 0
+        emitted = False
 
-        session = self._ensure_session()
+        while True:
+            await self._ensure_valid_credentials()
+            headers = self._signed_request(
+                body=body,
+                url=url,
+                method="POST",
+                credentials=self.credentials,
+                region_name=self.region_name,
+                **kwargs,
+            )
 
-        async with session.post(
-            url=url,
-            headers=headers,
-            data=body,
-        ) as res:
-            await self._handle_error_response(res)
+            try:
+                async with self._request(url=url, headers=headers, data=body) as res:  # noqa: E501
+                    await self._handle_error_response(res)
 
-            # Use botocore's EventStreamBuffer for proper event stream parsing
-            event_stream_buffer = EventStreamBuffer()
+                    event_stream_buffer = EventStreamBuffer()
 
-            async for chunk in res.content.iter_chunked(8192):
-                # Add raw bytes to the buffer
-                event_stream_buffer.add_data(chunk)
+                    async for chunk in res.content.iter_chunked(8192):
+                        event_stream_buffer.add_data(chunk)
 
-                # Extract and process all complete messages from the buffer
-                while True:
-                    try:
-                        # Get the next complete message from the buffer
-                        message = event_stream_buffer.next()
+                        while True:
+                            try:
+                                message = event_stream_buffer.next()
+                                processed_content = self._process_event_message(  # noqa: E501
+                                    message=message,
+                                )
+                                if processed_content is not None:
+                                    emitted = True
+                                    yield processed_content
+                            except StopIteration:
+                                break
+                            except Exception as e:
+                                log.error(f"Error processing event: {e}")
+                                break
 
-                        # Process the parsed message
-                        processed_content = self._process_event_message(
-                            message=message,
-                        )
-                        if processed_content is not None:
-                            yield processed_content
+                    while True:
+                        try:
+                            message = event_stream_buffer.next()
+                            processed_content = self._process_event_message(
+                                message,
+                            )
+                            if processed_content is not None:
+                                emitted = True
+                                yield processed_content
+                        except StopIteration:
+                            return
+                        except Exception as e:
+                            log.error(f"Error processing buffer: {e}")
+                            return
+            except asyncio.CancelledError:
+                raise
+            except BedrockStreamError:
+                raise
+            except Exception as exc:
+                if emitted or not self._should_retry(exc, attempt):
+                    raise
+                await self._sleep_backoff(attempt)
+                attempt += 1
 
-                    except StopIteration:
-                        # No more complete messages available, wait for data
-                        break
-                    except Exception as e:
-                        log.error(f"Error processing event stream: {e}")
-                        break
+    @overload
+    async def invoke_many(
+        self,
+        requests: Iterable[Mapping[str, Any]],
+        *,
+        concurrency: Optional[int] = None,
+        return_exceptions: Literal[False] = False,
+    ) -> Sequence[bytes]: ...
 
-            # Process any remaining complete messages in the buffer
-            while True:
-                try:
-                    message = event_stream_buffer.next()
-                    processed_content = self._process_event_message(message)
-                    if processed_content is not None:
-                        yield processed_content
-                except StopIteration:
-                    # All messages processed
-                    break
-                except Exception as e:
-                    log.error(f"Error processing remaining buffer: {e}")
-                    break
+    @overload
+    async def invoke_many(
+        self,
+        requests: Iterable[Mapping[str, Any]],
+        *,
+        concurrency: Optional[int] = None,
+        return_exceptions: Literal[True],
+    ) -> Sequence[Union[bytes, BaseException]]: ...
+
+    async def invoke_many(
+        self,
+        requests: Iterable[Mapping[str, Any]],
+        *,
+        concurrency: Optional[int] = None,
+        return_exceptions: bool = False,
+    ) -> Sequence[Union[bytes, BaseException]]:
+        """Invoke multiple requests concurrently."""
+
+        request_list = list(requests)
+        if not request_list:
+            return []
+
+        limiter: Optional[asyncio.Semaphore] = None
+        if concurrency and concurrency > 0:
+            limiter = asyncio.Semaphore(concurrency)
+
+        async def _invoke(entry: Mapping[str, Any]) -> bytes:
+            if "body" not in entry or "modelId" not in entry:
+                raise ValueError("Each request must include 'body' and 'modelId' keys")  # noqa: E501
+
+            body_value = entry["body"]
+            model_id = entry["modelId"]
+            extra = {
+                key: value
+                for key, value in entry.items()
+                if key not in {"body", "modelId"}
+            }
+
+            if limiter is not None:
+                async with limiter:
+                    return await self.invoke_model(
+                        body=body_value, modelId=model_id, **extra
+                    )
+
+            return await self.invoke_model(
+                body=body_value,
+                modelId=model_id,
+                **extra,
+            )
+
+        tasks = [asyncio.create_task(_invoke(item)) for item in request_list]
+        try:
+            if return_exceptions:
+                gathered = await asyncio.gather(*tasks, return_exceptions=True)
+                results: Sequence[Union[bytes, BaseException]] = tuple(gathered)  # noqa: E501
+            else:
+                gathered = await asyncio.gather(*tasks, return_exceptions=False)  # noqa: E501
+                results = tuple(gathered)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+        return results
 
     def _process_event_message(
         self,
@@ -363,7 +579,7 @@ class Client:
         }
 
         error_type = error_map.get(response.status, "UnknownException")
-        raise Exception(f"{response.status} {error_type}: {error_text}")
+        raise BedrockClientError(response.status, error_type, error_text)
 
     def _signed_request(
         self,
@@ -375,6 +591,12 @@ class Client:
         **kwargs,
     ) -> Dict[str, str]:
         """Create a signed AWS request"""
+        if credentials is None:
+            raise RuntimeError("AWS credentials are not initialized")
+
+        if hasattr(credentials, "get_frozen_credentials"):
+            credentials = credentials.get_frozen_credentials()
+
         request = AWSRequest(method=method, url=url, data=body)
         request.headers.add_header("Host", url.split("/")[2])
 

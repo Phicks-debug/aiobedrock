@@ -191,6 +191,23 @@ yields either parsed JSON objects or raw byte chunks depending on the payload.
   and surface the error payload in the exception message so you can respond or
   retry appropriately.
 
+#### invoke_many
+
+```python
+async invoke_many(requests: Iterable[Mapping[str, Any]], *, concurrency: Optional[int] = None, return_exceptions: bool = False) -> Sequence[Union[bytes, Exception]]
+```
+
+Runs multiple invocations concurrently while preserving the order of results.
+Each entry in `requests` must include `body` (JSON string) and `modelId`; any
+additional key/value pairs are forwarded to `invoke_model`.
+
+- `concurrency`: Optional per-call limit that overrides the client's global
+  `max_concurrency`.
+- `return_exceptions`: Mirrors `asyncio.gather`; when `True`, exceptions are
+  returned alongside successful responses instead of aborting the batch.
+
+See `example/invoke_many.py` for a complete usage example.
+
 #### close
 
 ```python
