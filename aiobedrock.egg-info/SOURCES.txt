@@ -11,3 +11,4 @@ aiobedrock.egg-info/SOURCES.txt
 aiobedrock.egg-info/dependency_links.txt
 aiobedrock.egg-info/requires.txt
 aiobedrock.egg-info/top_level.txt
+tests/test_client.py
