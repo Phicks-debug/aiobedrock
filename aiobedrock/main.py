@@ -326,7 +326,7 @@ class Client:
                 "X-Amzn-SageMaker-Custom-Attributes": custom_attributes,
                 "X-Amzn-SageMaker-Target-Variant": target_variant,
                 "X-Amzn-SageMaker-Target-Model": target_model,
-                "X-Amzn-SageMaker-Target-Container-Hostname": target_container_hostname,
+                "X-Amzn-SageMaker-Target-Container-Hostname": target_container_hostname,  # noqa: E501
                 "X-Amzn-SageMaker-Target-Channel": target_channel,
                 "X-Amzn-SageMaker-Inference-Components": inference_component,
                 "X-Amzn-SageMaker-Inference-Id": inference_id,
@@ -729,7 +729,10 @@ class Client:
             for kwarg_key, header_name in optional_headers:
                 value = kwargs.get(kwarg_key)
                 if value:
-                    request.headers.add_header(header_name, value)  # type: ignore[arg-type]
+                    request.headers.add_header(
+                        header_name,
+                        value,
+                    )
         else:
             if accept_header is not None:
                 request.headers.add_header("Accept", accept_header)

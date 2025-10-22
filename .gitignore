@@ -90,3 +90,5 @@ dist-ssr
 *.pyc
 .venv
 myenv
+.uv_cache
+.pytest_cache
