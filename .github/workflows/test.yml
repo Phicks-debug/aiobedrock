@@ -28,9 +28,14 @@ jobs:
           key: ${{ runner.os }}-uv-${{ hashFiles('pyproject.toml', 'requirements.txt') }}
           restore-keys: |
             ${{ runner.os }}-uv-
-      - name: Install project (optional)
+      - name: Install project
         run: |
-          uv pip install --system -r requirements.txt || true
+          uv pip install --system -r requirements.txt
+          uv pip install --system -e .
+      - name: Run tests
+        run: |
+          uv pip install --system pytest
+          uv run pytest
       - name: Lint packaging metadata
         run: |
           uv pip install --system build twine
