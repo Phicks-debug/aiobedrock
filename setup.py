@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -8,7 +8,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="aiobedrock",
-    version="0.3.0",
+    version="0.3.1",
     author="Phicks",
     author_email="an.tq@techxcorp.com",
     description="AWS boto3 bedrock client in async",
