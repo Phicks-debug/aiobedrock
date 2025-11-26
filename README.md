@@ -111,7 +111,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### Basic Model Invocation (Legacy)
+### Basic Model Invocation (More controll)
 
 For direct model invocation with model-specific request formats:
 
@@ -150,7 +150,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### Streaming Response (Legacy)
+### Streaming Response (More controll)
 
 ```python
 import json
@@ -402,16 +402,7 @@ Closes the aiohttp session.
 
 ## Supported Models
 
-aiobedrock supports all models available on AWS Bedrock, including:
-
-- **Anthropic Claude** (Claude 3.5 Sonnet, Claude 3 Opus/Sonnet/Haiku, Claude 4 models)
-- **Amazon Nova** (Nova Pro, Nova Lite, Nova Micro)
-- **Amazon Titan** (Titan Text, Titan Embeddings)
-- **Meta Llama** (Llama 3.x models)
-- **Mistral AI** (Mistral Large, Mixtral)
-- **Cohere** (Command R, Command R+)
-- **AI21 Labs** (Jamba models)
-
+aiobedrock supports all models available on AWS Bedrock, AWS Sagemaker
 Ensure you have appropriate permissions to access these models in your AWS account.
 
 ## Error Handling
