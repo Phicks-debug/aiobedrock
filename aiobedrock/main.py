@@ -3,6 +3,7 @@ import base64
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncGenerator,
     Dict,
@@ -15,6 +16,17 @@ from typing import (
     overload,
 )
 from urllib.parse import urlparse
+
+if TYPE_CHECKING:
+    from mypy_boto3_bedrock_runtime.type_defs import (
+        GuardrailConfigurationTypeDef,
+        GuardrailStreamConfigurationTypeDef,
+        InferenceConfigurationTypeDef,
+        MessageTypeDef,
+        PerformanceConfigurationTypeDef,
+        SystemContentBlockTypeDef,
+        ToolConfigurationTypeDef,
+    )
 
 import aiohttp
 import boto3
@@ -661,6 +673,7 @@ class Client:
             424: "ModelErrorException",
             429: "ThrottlingException",
             500: "InternalServerException",
+            503: "ServiceUnavailableException",
         }
 
         error_type = error_map.get(response.status, "UnknownException")
@@ -693,7 +706,7 @@ class Client:
 
         if service == "bedrock":
             # Set appropriate headers based on the endpoint
-            if "invoke-with-response-stream" in url:
+            if "invoke-with-response-stream" in url or "converse-stream" in url:
                 request.headers.add_header(
                     "Accept",
                     "application/vnd.amazon.eventstream",
@@ -747,3 +760,363 @@ class Client:
         # Sign the request
         SigV4Auth(credentials, service, region_name).add_auth(request)
         return dict(request.headers)
+
+    async def converse(
+        self,
+        modelId: str,
+        messages: Union[Sequence["MessageTypeDef"], Sequence[Mapping[str, Any]]],
+        *,
+        system: Optional[
+            Union[Sequence["SystemContentBlockTypeDef"], Sequence[Mapping[str, Any]]]
+        ] = None,
+        inferenceConfig: Optional[
+            Union["InferenceConfigurationTypeDef", Mapping[str, Any]]
+        ] = None,
+        toolConfig: Optional[
+            Union["ToolConfigurationTypeDef", Mapping[str, Any]]
+        ] = None,
+        guardrailConfig: Optional[
+            Union["GuardrailConfigurationTypeDef", Mapping[str, Any]]
+        ] = None,
+        additionalModelRequestFields: Optional[Mapping[str, Any]] = None,
+        additionalModelResponseFieldPaths: Optional[Sequence[str]] = None,
+        promptVariables: Optional[Mapping[str, Any]] = None,
+        requestMetadata: Optional[Mapping[str, str]] = None,
+        performanceConfig: Optional[
+            Union["PerformanceConfigurationTypeDef", Mapping[str, Any]]
+        ] = None,
+    ) -> bytes:
+        """
+        Invoke a model using the Converse API and return the response as bytes.
+
+        The Converse API provides a consistent interface across all Bedrock models
+        that support messages.
+        """
+        url = f"https://bedrock-runtime.{self.region_name}.amazonaws.com/model/{modelId}/converse"  # noqa: E501
+
+        # Build request body - only include non-None values
+        body_dict: Dict[str, Any] = {"messages": list(messages)}
+
+        if system is not None:
+            body_dict["system"] = list(system)
+        if inferenceConfig is not None:
+            body_dict["inferenceConfig"] = inferenceConfig
+        if toolConfig is not None:
+            body_dict["toolConfig"] = toolConfig
+        if guardrailConfig is not None:
+            body_dict["guardrailConfig"] = guardrailConfig
+        if additionalModelRequestFields is not None:
+            body_dict["additionalModelRequestFields"] = additionalModelRequestFields
+        if additionalModelResponseFieldPaths is not None:
+            body_dict["additionalModelResponseFieldPaths"] = list(
+                additionalModelResponseFieldPaths
+            )
+        if promptVariables is not None:
+            body_dict["promptVariables"] = promptVariables
+        if requestMetadata is not None:
+            body_dict["requestMetadata"] = requestMetadata
+        if performanceConfig is not None:
+            body_dict["performanceConfig"] = performanceConfig
+
+        body = orjson.dumps(body_dict)
+
+        attempt = 0
+        while True:
+            await self._ensure_valid_credentials()
+            headers = self._signed_request(
+                body=body,
+                url=url,
+                method="POST",
+                credentials=self.credentials,
+                region_name=self.region_name,
+            )
+
+            try:
+                async with self._request(url=url, headers=headers, data=body) as res:
+                    await self._handle_error_response(res)
+                    return await res.read()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not self._should_retry(exc, attempt):
+                    raise
+                await self._sleep_backoff(attempt)
+                attempt += 1
+
+    def _process_converse_stream_event(
+        self,
+        message,
+    ) -> Optional[Dict[str, Any]]:
+        """Process a ConverseStream event message and return typed event dict."""
+        try:
+            # Handle EventStreamMessage objects
+            if hasattr(message, "headers") and hasattr(message, "payload"):
+                headers = getattr(message, "headers", {})
+                payload = getattr(message, "payload", b"")
+            # Handle dict-like objects from manual parsing
+            elif isinstance(message, dict):
+                headers = message.get("headers", {})
+                payload = message.get("payload", b"")
+            else:
+                log.warning(f"Unexpected message type: {type(message)}")
+                return None
+
+            headers_dict = self._normalize_headers(headers)
+
+            message_type = headers_dict.get(":message-type")
+            exception_type = headers_dict.get(":exception-type")
+            event_type = headers_dict.get(":event-type")
+
+            if isinstance(payload, memoryview):
+                payload = payload.tobytes()
+            elif isinstance(payload, bytearray):
+                payload = bytes(payload)
+
+            # Handle errors
+            if message_type in {"exception", "error"} or (
+                message_type == "event"
+                and event_type
+                in {
+                    "error",
+                    "exception",
+                    "modelStreamErrorException",
+                    "internalServerException",
+                    "validationException",
+                    "throttlingException",
+                    "serviceUnavailableException",
+                }
+            ):
+                detail = self._decode_payload_text(payload)
+                raise BedrockStreamError(
+                    message_type=message_type or "event",
+                    exception_type=exception_type or event_type or "UnknownException",
+                    detail=detail,
+                )
+
+            if not payload:
+                return None
+
+            # Parse JSON payload directly for ConverseStream events
+            try:
+                payload_data = orjson.loads(payload)
+
+                # Return the event with its type as key
+                # ConverseStream events: messageStart, contentBlockStart,
+                # contentBlockDelta, contentBlockStop, messageStop, metadata
+                if event_type:
+                    return {event_type: payload_data}
+                return payload_data
+
+            except orjson.JSONDecodeError as e:
+                log.error(f"Failed to parse JSON payload: {e}")
+                return None
+
+        except BedrockStreamError:
+            raise
+        except Exception as e:
+            log.error(f"Error processing converse stream event: {e}")
+            return None
+
+    async def converse_stream(
+        self,
+        modelId: str,
+        messages: Union[Sequence["MessageTypeDef"], Sequence[Mapping[str, Any]]],
+        *,
+        system: Optional[
+            Union[Sequence["SystemContentBlockTypeDef"], Sequence[Mapping[str, Any]]]
+        ] = None,
+        inferenceConfig: Optional[
+            Union["InferenceConfigurationTypeDef", Mapping[str, Any]]
+        ] = None,
+        toolConfig: Optional[
+            Union["ToolConfigurationTypeDef", Mapping[str, Any]]
+        ] = None,
+        guardrailConfig: Optional[
+            Union["GuardrailStreamConfigurationTypeDef", Mapping[str, Any]]
+        ] = None,
+        additionalModelRequestFields: Optional[Mapping[str, Any]] = None,
+        additionalModelResponseFieldPaths: Optional[Sequence[str]] = None,
+        promptVariables: Optional[Mapping[str, Any]] = None,
+        requestMetadata: Optional[Mapping[str, str]] = None,
+        performanceConfig: Optional[
+            Union["PerformanceConfigurationTypeDef", Mapping[str, Any]]
+        ] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Invoke a model using the ConverseStream API with streaming response.
+
+        Yields event dictionaries like:
+        - {"messageStart": {"role": "assistant"}}
+        - {"contentBlockDelta": {"delta": {"text": "..."}, "contentBlockIndex": 0}}
+        - {"messageStop": {"stopReason": "end_turn"}}
+        - {"metadata": {"usage": {...}, "metrics": {...}}}
+        """
+        url = f"https://bedrock-runtime.{self.region_name}.amazonaws.com/model/{modelId}/converse-stream"  # noqa: E501
+
+        # Build request body - only include non-None values
+        body_dict: Dict[str, Any] = {"messages": list(messages)}
+
+        if system is not None:
+            body_dict["system"] = list(system)
+        if inferenceConfig is not None:
+            body_dict["inferenceConfig"] = inferenceConfig
+        if toolConfig is not None:
+            body_dict["toolConfig"] = toolConfig
+        if guardrailConfig is not None:
+            body_dict["guardrailConfig"] = guardrailConfig
+        if additionalModelRequestFields is not None:
+            body_dict["additionalModelRequestFields"] = additionalModelRequestFields
+        if additionalModelResponseFieldPaths is not None:
+            body_dict["additionalModelResponseFieldPaths"] = list(
+                additionalModelResponseFieldPaths
+            )
+        if promptVariables is not None:
+            body_dict["promptVariables"] = promptVariables
+        if requestMetadata is not None:
+            body_dict["requestMetadata"] = requestMetadata
+        if performanceConfig is not None:
+            body_dict["performanceConfig"] = performanceConfig
+
+        body = orjson.dumps(body_dict)
+
+        attempt = 0
+        emitted = False
+
+        while True:
+            await self._ensure_valid_credentials()
+            headers = self._signed_request(
+                body=body,
+                url=url,
+                method="POST",
+                credentials=self.credentials,
+                region_name=self.region_name,
+            )
+
+            try:
+                async with self._request(url=url, headers=headers, data=body) as res:
+                    await self._handle_error_response(res)
+
+                    event_stream_buffer = EventStreamBuffer()
+
+                    async for chunk in res.content.iter_chunked(8192):
+                        event_stream_buffer.add_data(chunk)
+
+                        while True:
+                            try:
+                                message = event_stream_buffer.next()
+                                processed_content = self._process_converse_stream_event(
+                                    message
+                                )
+                                if processed_content is not None:
+                                    emitted = True
+                                    yield processed_content
+                            except StopIteration:
+                                break
+                            except BedrockStreamError:
+                                raise
+                            except Exception as e:
+                                log.error(f"Error processing event: {e}")
+                                break
+
+                    # Process remaining buffer
+                    while True:
+                        try:
+                            message = event_stream_buffer.next()
+                            processed_content = self._process_converse_stream_event(
+                                message
+                            )
+                            if processed_content is not None:
+                                emitted = True
+                                yield processed_content
+                        except StopIteration:
+                            return
+                        except BedrockStreamError:
+                            raise
+                        except Exception as e:
+                            log.error(f"Error processing buffer: {e}")
+                            return
+            except asyncio.CancelledError:
+                raise
+            except BedrockStreamError:
+                raise
+            except Exception as exc:
+                if emitted or not self._should_retry(exc, attempt):
+                    raise
+                await self._sleep_backoff(attempt)
+                attempt += 1
+
+    @overload
+    async def converse_many(
+        self,
+        requests: Iterable[Mapping[str, Any]],
+        *,
+        concurrency: Optional[int] = None,
+        return_exceptions: Literal[False] = False,
+    ) -> Sequence[bytes]: ...
+
+    @overload
+    async def converse_many(
+        self,
+        requests: Iterable[Mapping[str, Any]],
+        *,
+        concurrency: Optional[int] = None,
+        return_exceptions: Literal[True],
+    ) -> Sequence[Union[bytes, BaseException]]: ...
+
+    async def converse_many(
+        self,
+        requests: Iterable[Mapping[str, Any]],
+        *,
+        concurrency: Optional[int] = None,
+        return_exceptions: bool = False,
+    ) -> Sequence[Union[bytes, BaseException]]:
+        """
+        Invoke multiple converse requests concurrently.
+
+        Each request dict must contain 'modelId' and 'messages' keys.
+        Optional keys: system, inferenceConfig, toolConfig, guardrailConfig,
+        additionalModelRequestFields, additionalModelResponseFieldPaths,
+        promptVariables, requestMetadata, performanceConfig.
+        """
+        request_list = list(requests)
+        if not request_list:
+            return []
+
+        limiter: Optional[asyncio.Semaphore] = None
+        if concurrency and concurrency > 0:
+            limiter = asyncio.Semaphore(concurrency)
+
+        async def _converse(entry: Mapping[str, Any]) -> bytes:
+            if "modelId" not in entry or "messages" not in entry:
+                raise ValueError(
+                    "Each request must include 'modelId' and 'messages' keys"
+                )
+
+            model_id = entry["modelId"]
+            messages = entry["messages"]
+            kwargs = {
+                k: v for k, v in entry.items() if k not in {"modelId", "messages"}
+            }
+
+            if limiter is not None:
+                async with limiter:
+                    return await self.converse(
+                        modelId=model_id, messages=messages, **kwargs
+                    )
+
+            return await self.converse(modelId=model_id, messages=messages, **kwargs)
+
+        tasks = [asyncio.create_task(_converse(item)) for item in request_list]
+        try:
+            if return_exceptions:
+                gathered = await asyncio.gather(*tasks, return_exceptions=True)
+                results: Sequence[Union[bytes, BaseException]] = tuple(gathered)
+            else:
+                gathered = await asyncio.gather(*tasks, return_exceptions=False)
+                results = tuple(gathered)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+        return results

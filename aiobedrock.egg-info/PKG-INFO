@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: aiobedrock
-Version: 0.3.1
+Version: 0.4
 Summary: AWS boto3 bedrock client in async
 Home-page: https://github.com/Phicks-debug/aiobedrock
 Author: Phicks
@@ -22,6 +22,8 @@ Requires-Dist: boto3>=1.35.84
 Requires-Dist: aiohttp>=3.9.5
 Requires-Dist: orjson>=3.10.18
 Requires-Dist: logsim>=0.2.32
+Provides-Extra: types
+Requires-Dist: mypy-boto3-bedrock-runtime>=1.35.0; extra == "types"
 Dynamic: author
 Dynamic: author-email
 Dynamic: classifier
@@ -29,6 +31,7 @@ Dynamic: description
 Dynamic: description-content-type
 Dynamic: home-page
 Dynamic: license-file
+Dynamic: provides-extra
 Dynamic: requires-dist
 Dynamic: requires-python
 Dynamic: summary
@@ -45,10 +48,13 @@ An asynchronous Python client for AWS Bedrock, providing non-blocking access to 
 
 - **Fully Asynchronous**: Non-blocking API calls using `aiohttp`
 - **Low Overhead**: Minimal dependencies with efficient implementation
+- **Converse API**: Unified API for all Bedrock models with structured messages
 - **Streaming Support**: Stream responses for real-time AI model interactions
 - **Guardrail Integration**: Support for AWS Bedrock Guardrails
 - **AWS SigV4 Auth**: Proper AWS authentication for secure API calls
+- **Batch Processing**: Concurrent batch invocations with `invoke_many` and `converse_many`
 - **Error Handling**: Comprehensive error handling with descriptive exceptions
+- **Type Hints**: Optional type checking support with `mypy-boto3-bedrock-runtime`
 
 ## Installation
 
@@ -56,15 +62,96 @@ An asynchronous Python client for AWS Bedrock, providing non-blocking access to 
 pip install aiobedrock
 ```
 
+For type checking support (optional):
+
+```bash
+pip install aiobedrock[types]
+```
+
 ## Requirements
 
 - Python 3.9 or later (tested through Python 3.14)
 - AWS credentials configured in your environment
-- boto3 1.35.84 or newer (installed automatically via dependencies)
+- boto3 1.38.21 or newer (installed automatically via dependencies)
 
 ## Quick Start
 
-### Basic Model Invocation
+### Converse API (Recommended)
+
+The Converse API provides a unified interface for all Bedrock models:
+
+```python
+import json
+import asyncio
+from aiobedrock import Client
+
+async def main():
+    async with Client(region_name="us-west-2") as client:
+        messages = [
+            {
+                "role": "user",
+                "content": [{"text": "What is the capital of France?"}],
+            }
+        ]
+
+        response = await client.converse(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            messages=messages,
+            inferenceConfig={
+                "maxTokens": 1024,
+                "temperature": 0.7,
+            },
+        )
+
+        result = json.loads(response.decode("utf-8"))
+        print(json.dumps(result, indent=2))
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Converse Streaming
+
+```python
+import asyncio
+from aiobedrock import Client
+
+async def main():
+    async with Client(region_name="us-west-2") as client:
+        messages = [
+            {
+                "role": "user",
+                "content": [{"text": "Tell me a short story about a robot."}],
+            }
+        ]
+
+        print("Assistant: ", end="", flush=True)
+
+        async for event in client.converse_stream(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            messages=messages,
+            inferenceConfig={
+                "maxTokens": 1024,
+                "temperature": 0.7,
+            },
+        ):
+            if "contentBlockDelta" in event:
+                delta = event["contentBlockDelta"].get("delta", {})
+                if "text" in delta:
+                    print(delta["text"], end="", flush=True)
+            elif "messageStop" in event:
+                print(f"\n[Stop reason: {event['messageStop'].get('stopReason')}]")
+            elif "metadata" in event:
+                usage = event["metadata"].get("usage", {})
+                print(f"[Tokens - Input: {usage.get('inputTokens')}, Output: {usage.get('outputTokens')}]")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Basic Model Invocation (Legacy)
+
+For direct model invocation with model-specific request formats:
 
 ```python
 import json
@@ -101,7 +188,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### Streaming Response
+### Streaming Response (Legacy)
 
 ```python
 import json
@@ -181,7 +268,18 @@ if __name__ == "__main__":
 ### Client
 
 ```python
-Client(region_name: str)
+Client(
+    region_name: str,
+    assume_role_arn: Optional[str] = None,
+    *,
+    max_connections: int = 10000,
+    request_timeout: Optional[float] = None,
+    max_concurrency: Optional[int] = None,
+    max_retries: int = 2,
+    retry_backoff: float = 0.5,
+    max_backoff: float = 6.0,
+    retry_statuses: Optional[Sequence[int]] = None,
+)
 ```
 
 Creates a new Bedrock client instance.
@@ -190,9 +288,83 @@ The underlying `aiohttp.ClientSession` is created lazily when first used. You
 can interact with the client by using `async with` or by awaiting individual
 methods directly; both patterns will create a shared session automatically.
 
-- **region_name**: AWS region where Bedrock is available (e.g., "us-east-1", "us-west-2", "ap-southeast-1")
+- **region_name**: AWS region where Bedrock is available (e.g., "us-east-1", "us-west-2")
+- **assume_role_arn**: Optional ARN of an IAM role to assume for cross-account access
+- **max_connections**: Maximum number of connections in the pool (default: 10000)
+- **request_timeout**: Optional request timeout in seconds
+- **max_concurrency**: Optional maximum concurrent requests
+- **max_retries**: Maximum number of retry attempts (default: 2)
+- **retry_backoff**: Initial backoff delay in seconds (default: 0.5)
+- **max_backoff**: Maximum backoff delay in seconds (default: 6.0)
+- **retry_statuses**: HTTP status codes to retry (default: 408, 424, 429, 500, 502, 503, 504)
 
 ### Methods
+
+#### converse
+
+```python
+async converse(
+    modelId: str,
+    messages: Sequence[MessageTypeDef],
+    *,
+    system: Optional[Sequence[SystemContentBlockTypeDef]] = None,
+    inferenceConfig: Optional[InferenceConfigurationTypeDef] = None,
+    toolConfig: Optional[ToolConfigurationTypeDef] = None,
+    guardrailConfig: Optional[GuardrailConfigurationTypeDef] = None,
+    additionalModelRequestFields: Optional[Mapping[str, Any]] = None,
+    additionalModelResponseFieldPaths: Optional[Sequence[str]] = None,
+    promptVariables: Optional[Mapping[str, Any]] = None,
+    requestMetadata: Optional[Mapping[str, str]] = None,
+    performanceConfig: Optional[PerformanceConfigurationTypeDef] = None,
+) -> bytes
+```
+
+Invokes a Bedrock model using the Converse API and returns the complete response as bytes.
+
+- **modelId**: Bedrock model identifier
+- **messages**: List of conversation messages with `role` and `content`
+- **system**: Optional system prompts
+- **inferenceConfig**: Optional inference parameters (`maxTokens`, `temperature`, `topP`, `stopSequences`)
+- **toolConfig**: Optional tool configuration for function calling
+- **guardrailConfig**: Optional guardrail configuration
+- **additionalModelRequestFields**: Optional model-specific parameters
+- **performanceConfig**: Optional performance configuration (`latency`: "standard" or "optimized")
+
+#### converse_stream
+
+```python
+async converse_stream(
+    modelId: str,
+    messages: Sequence[MessageTypeDef],
+    *,
+    # Same optional parameters as converse()
+) -> AsyncGenerator[Dict[str, Any], None]
+```
+
+Invokes a Bedrock model using the ConverseStream API and yields streaming events.
+
+Event types:
+- `{"messageStart": {"role": "assistant"}}` - Message started
+- `{"contentBlockStart": {...}}` - Content block started
+- `{"contentBlockDelta": {"delta": {"text": "..."}, "contentBlockIndex": 0}}` - Text delta
+- `{"contentBlockStop": {"contentBlockIndex": 0}}` - Content block completed
+- `{"messageStop": {"stopReason": "end_turn"}}` - Message completed
+- `{"metadata": {"usage": {...}, "metrics": {...}}}` - Usage metadata
+
+#### converse_many
+
+```python
+async converse_many(
+    requests: Iterable[Mapping[str, Any]],
+    *,
+    concurrency: Optional[int] = None,
+    return_exceptions: bool = False,
+) -> Sequence[Union[bytes, BaseException]]
+```
+
+Runs multiple converse invocations concurrently while preserving the order of results.
+Each entry in `requests` must include `modelId` and `messages`; any additional key/value
+pairs are forwarded to `converse`.
 
 #### invoke_model
 
@@ -243,6 +415,21 @@ additional key/value pairs are forwarded to `invoke_model`.
 
 See `example/invoke_many.py` for a complete usage example.
 
+#### invoke_sagemaker_endpoint
+
+```python
+async invoke_sagemaker_endpoint(
+    endpoint_name: str,
+    *,
+    body: Union[str, bytes],
+    content_type: Optional[str] = None,
+    accept: Optional[str] = None,
+    # ... additional SageMaker-specific headers
+) -> bytes
+```
+
+Invokes a SageMaker endpoint asynchronously.
+
 #### close
 
 ```python
@@ -253,7 +440,15 @@ Closes the aiohttp session.
 
 ## Supported Models
 
-aiobedrock supports all models available on AWS Bedrock.
+aiobedrock supports all models available on AWS Bedrock, including:
+
+- **Anthropic Claude** (Claude 3.5 Sonnet, Claude 3 Opus/Sonnet/Haiku, Claude 4 models)
+- **Amazon Nova** (Nova Pro, Nova Lite, Nova Micro)
+- **Amazon Titan** (Titan Text, Titan Embeddings)
+- **Meta Llama** (Llama 3.x models)
+- **Mistral AI** (Mistral Large, Mixtral)
+- **Cohere** (Command R, Command R+)
+- **AI21 Labs** (Jamba models)
 
 Ensure you have appropriate permissions to access these models in your AWS account.
 
@@ -262,10 +457,11 @@ Ensure you have appropriate permissions to access these models in your AWS accou
 The client provides detailed error messages for common Bedrock API errors:
 
 - 403: AccessDeniedException
-- 500: InternalServerException
-- 424: ModelErrorException
 - 408: ModelTimeoutException
+- 424: ModelErrorException
 - 429: ThrottlingException
+- 500: InternalServerException
+- 503: ServiceUnavailableException
 
 In addition, when the streaming API surfaces an error event the library raises
 `BedrockStreamError` with the exception type that Bedrock reported (for
