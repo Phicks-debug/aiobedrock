@@ -27,6 +27,11 @@ if TYPE_CHECKING:
         SystemContentBlockTypeDef,
         ToolConfigurationTypeDef,
     )
+    from typing import TypedDict
+
+    # ServiceTierConfigTypeDef for converse/converse_stream endpoints
+    class ServiceTierConfigTypeDef(TypedDict, total=False):
+        type: Literal["priority", "default", "flex", "reserved"]
 
 import aiohttp
 import boto3
@@ -737,6 +742,10 @@ class Client:
                     "performanceConfigLatency",
                     "X-Amzn-Bedrock-PerformanceConfig-Latency",
                 ),
+                (
+                    "serviceTier",
+                    "X-Amzn-Bedrock-ServiceTier",
+                ),
             ]
 
             for kwarg_key, header_name in optional_headers:
@@ -785,6 +794,9 @@ class Client:
         performanceConfig: Optional[
             Union["PerformanceConfigurationTypeDef", Mapping[str, Any]]
         ] = None,
+        serviceTier: Optional[
+            Union["ServiceTierConfigTypeDef", Mapping[str, Any]]
+        ] = None,
     ) -> bytes:
         """
         Invoke a model using the Converse API and return the response as bytes.
@@ -817,6 +829,8 @@ class Client:
             body_dict["requestMetadata"] = requestMetadata
         if performanceConfig is not None:
             body_dict["performanceConfig"] = performanceConfig
+        if serviceTier is not None:
+            body_dict["serviceTier"] = serviceTier
 
         body = orjson.dumps(body_dict)
 
@@ -941,6 +955,9 @@ class Client:
         performanceConfig: Optional[
             Union["PerformanceConfigurationTypeDef", Mapping[str, Any]]
         ] = None,
+        serviceTier: Optional[
+            Union["ServiceTierConfigTypeDef", Mapping[str, Any]]
+        ] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Invoke a model using the ConverseStream API with streaming response.
@@ -976,6 +993,8 @@ class Client:
             body_dict["requestMetadata"] = requestMetadata
         if performanceConfig is not None:
             body_dict["performanceConfig"] = performanceConfig
+        if serviceTier is not None:
+            body_dict["serviceTier"] = serviceTier
 
         body = orjson.dumps(body_dict)
 
@@ -1076,7 +1095,7 @@ class Client:
         Each request dict must contain 'modelId' and 'messages' keys.
         Optional keys: system, inferenceConfig, toolConfig, guardrailConfig,
         additionalModelRequestFields, additionalModelResponseFieldPaths,
-        promptVariables, requestMetadata, performanceConfig.
+        promptVariables, requestMetadata, performanceConfig, serviceTier.
         """
         request_list = list(requests)
         if not request_list:
