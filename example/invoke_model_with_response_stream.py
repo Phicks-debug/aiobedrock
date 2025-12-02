@@ -31,7 +31,7 @@ async def main():
             accept="application/json",
             contentType="application/json",
             trace="ENABLED_FULL",
-            serviceTier="priority",
+            serviceTier="flex",
         ):
             if isinstance(chunk, bytes):
                 print(chunk.decode("utf-8"))

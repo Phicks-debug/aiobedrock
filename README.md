@@ -13,6 +13,7 @@ An asynchronous Python client for AWS Bedrock, providing non-blocking access to 
 - **Converse API**: Unified API for all Bedrock models with structured messages
 - **Streaming Support**: Stream responses for real-time AI model interactions
 - **Guardrail Integration**: Support for AWS Bedrock Guardrails
+- **Service Tier Support**: Configure processing tiers (priority, default, flex, reserved)
 - **AWS SigV4 Auth**: Proper AWS authentication for secure API calls
 - **Batch Processing**: Concurrent batch invocations with `invoke_many` and `converse_many`
 - **Error Handling**: Comprehensive error handling with descriptive exceptions
@@ -278,6 +279,7 @@ async converse(
     promptVariables: Optional[Mapping[str, Any]] = None,
     requestMetadata: Optional[Mapping[str, str]] = None,
     performanceConfig: Optional[PerformanceConfigurationTypeDef] = None,
+    serviceTier: Optional[ServiceTierConfigTypeDef] = None,
 ) -> bytes
 ```
 
@@ -291,6 +293,7 @@ Invokes a Bedrock model using the Converse API and returns the complete response
 - **guardrailConfig**: Optional guardrail configuration
 - **additionalModelRequestFields**: Optional model-specific parameters
 - **performanceConfig**: Optional performance configuration (`latency`: "standard" or "optimized")
+- **serviceTier**: Optional service tier configuration (`type`: "priority", "default", "flex", or "reserved")
 
 #### converse_stream
 
@@ -345,6 +348,7 @@ Invokes a Bedrock model and returns the complete response.
   - **guardrailIdentifier**: ARN of the guardrail to use
   - **guardrailVersion**: Version of the guardrail (e.g., "1" or "LATEST")
   - **performanceConfigLatency**: Performance configuration for latency. Valid values are "standard" or "optimized".
+  - **serviceTier**: Processing tier type. Valid values are "priority", "default", "flex", or "reserved".
 
 #### invoke_model_with_response_stream
 
