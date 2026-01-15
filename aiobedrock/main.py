@@ -73,6 +73,8 @@ class Client:
         region_name: str,
         assume_role_arn: Optional[str] = None,
         *,
+        profile_name: Optional[str] = None,
+        aws_account_id: Optional[str] = None,
         max_connections: int = 10000,
         request_timeout: Optional[float] = None,
         max_concurrency: Optional[int] = None,
@@ -83,6 +85,8 @@ class Client:
     ):
         self.region_name = region_name
         self.assume_role_arn = assume_role_arn
+        self.profile_name = profile_name
+        self.aws_account_id = aws_account_id
         self.connector = aiohttp.TCPConnector(
             limit=max_connections,
             ttl_dns_cache=3600,
@@ -131,7 +135,13 @@ class Client:
     def _refresh_credentials_sync(self):
         """Refresh AWS credentials, handling role assumption if needed"""
         if self.assume_role_arn:
-            sts_client = boto3.client("sts")
+            # Create STS client using profile if specified
+            if self.profile_name:
+                base_session = boto3.Session(profile_name=self.profile_name)
+                sts_client = base_session.client("sts")
+            else:
+                sts_client = boto3.client("sts")
+
             response = sts_client.assume_role(
                 RoleArn=self.assume_role_arn,
                 RoleSessionName="aiobedrock",
@@ -154,8 +164,11 @@ class Client:
                 region_name=self.region_name,
             )
         else:
-            # Use default credentials
-            boto3_session = boto3.Session(region_name=self.region_name)
+            # Use profile credentials if specified, otherwise use default
+            boto3_session = boto3.Session(
+                profile_name=self.profile_name,
+                region_name=self.region_name,
+            )
 
         self.credentials = boto3_session.get_credentials()
 
