@@ -1,7 +1,7 @@
-boto3>=1.35.84
-aiohttp>=3.9.5
-orjson>=3.10.18
+boto3>=1.42.29
+aiohttp>=3.13.3
+orjson>=3.11.5
 logsim>=0.2.32
 
 [types]
-mypy-boto3-bedrock-runtime>=1.35.0
+mypy-boto3-bedrock-runtime>=1.42.3

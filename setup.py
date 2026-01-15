@@ -8,14 +8,14 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="aiobedrock",
-    version="0.4.1",
+    version="0.5.0",
     author="Phicks",
     author_email="an.tq@techxcorp.com",
     description="AWS boto3 bedrock client in async",
     long_description=long_description,
     install_requires=requirements,
     extras_require={
-        "types": ["mypy-boto3-bedrock-runtime>=1.35.0"],
+        "types": ["mypy-boto3-bedrock-runtime>=1.42.3"],
     },
     long_description_content_type="text/markdown",
     url="https://github.com/Phicks-debug/aiobedrock",
