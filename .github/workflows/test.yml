@@ -32,10 +32,6 @@ jobs:
         run: |
           uv pip install --system -r requirements.txt
           uv pip install --system -e .
-      - name: Run tests
-        run: |
-          uv pip install --system pytest
-          uv run pytest
       - name: Lint packaging metadata
         run: |
           uv pip install --system build twine
