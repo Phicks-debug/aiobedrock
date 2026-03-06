@@ -21,7 +21,7 @@ async def main():
                 "maxTokens": 1024,
                 "temperature": 0.7,
             },
-            serviceTier={"type": "standard"},
+            serviceTier={"type": "default"},
         ):
             # Handle different event types
             if "messageStart" in event:

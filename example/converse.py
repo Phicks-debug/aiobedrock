@@ -20,7 +20,7 @@ async def main():
                 "maxTokens": 1024,
                 "temperature": 0.7,
             },
-            serviceTier={"type": "standard"},
+            serviceTier={"type": "default"},
         )
 
         result = json.loads(response.decode("utf-8"))

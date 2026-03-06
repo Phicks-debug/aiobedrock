@@ -12,11 +12,14 @@ An asynchronous Python client for AWS Bedrock, providing non-blocking access to 
 - **Low Overhead**: Minimal dependencies with efficient implementation
 - **Converse API**: Unified API for all Bedrock models with structured messages
 - **Streaming Support**: Stream responses for real-time AI model interactions
-- **Guardrail Integration**: Support for AWS Bedrock Guardrails
+- **Structured Output**: JSON schema output support via `outputConfig`
+- **Guardrail Integration**: Support for AWS Bedrock Guardrails, including standalone `apply_guardrail`
+- **Token Counting**: Count tokens before sending requests with `count_tokens`
+- **Async Invocations**: Background model invocations with S3 output via `start_async_invoke`
 - **Service Tier Support**: Configure processing tiers (priority, default, flex, reserved)
 - **AWS SigV4 Auth**: Proper AWS authentication for secure API calls
 - **Batch Processing**: Concurrent batch invocations with `invoke_many` and `converse_many`
-- **Error Handling**: Comprehensive error handling with descriptive exceptions
+- **Error Handling**: Comprehensive error handling with `BedrockClientError` and `BedrockStreamError`
 - **Type Hints**: Optional type checking support with `mypy-boto3-bedrock-runtime`
 
 ## Installation
@@ -35,7 +38,7 @@ pip install aiobedrock[types]
 
 - Python 3.9 or later (tested through Python 3.14)
 - AWS credentials configured in your environment
-- boto3 1.38.21 or newer (installed automatically via dependencies)
+- boto3 1.42.29 or newer (installed automatically via dependencies)
 
 ## Quick Start
 
@@ -112,7 +115,146 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### Basic Model Invocation (More controll)
+### Structured JSON Output
+
+Use `outputConfig` to enforce JSON schema output:
+
+```python
+import json
+import asyncio
+from aiobedrock import Client
+
+async def main():
+    async with Client(region_name="us-west-2") as client:
+        response = await client.converse(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"text": "List 3 capitals in Europe."}],
+                }
+            ],
+            outputConfig={
+                "textFormat": {
+                    "type": "json_schema",
+                    "structure": {
+                        "jsonSchema": {
+                            "type": "object",
+                            "properties": {
+                                "capitals": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+        )
+        print(json.loads(response.decode("utf-8")))
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Token Counting
+
+Count tokens before sending a request:
+
+```python
+import asyncio
+from aiobedrock import Client
+
+async def main():
+    async with Client(region_name="us-west-2") as client:
+        result = await client.count_tokens(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"text": "What is the capital of France?"}],
+                }
+            ],
+            system=[{"text": "Be concise."}],
+        )
+        print(f"Input tokens: {result['inputTokens']}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Apply Guardrail
+
+Evaluate content against a guardrail without invoking a model:
+
+```python
+import asyncio
+import json
+from aiobedrock import Client
+
+async def main():
+    async with Client(region_name="us-west-2") as client:
+        result = await client.apply_guardrail(
+            guardrailIdentifier="YOUR_GUARDRAIL_ID",
+            guardrailVersion="1",
+            source="INPUT",
+            content=[{"text": {"text": "Is this content safe?"}}],
+        )
+        print(f"Action: {result['action']}")
+        print(json.dumps(result, indent=2))
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Async Invocation
+
+Start a background model invocation with output stored in S3:
+
+```python
+import asyncio
+import json
+import time
+from aiobedrock import Client
+
+async def main():
+    async with Client(region_name="us-west-2") as client:
+        result = await client.start_async_invoke(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            modelInput={
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 1024,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Write a haiku."}],
+                    }
+                ],
+            },
+            outputDataConfig={
+                "s3OutputDataConfig": {"s3Uri": "s3://YOUR_BUCKET/output/"}
+            },
+        )
+        arn = result["invocationArn"]
+        print(f"Started: {arn}")
+
+        # Poll for completion
+        while True:
+            status = await client.get_async_invoke(invocationArn=arn)
+            if status.get("status") in ("Completed", "Failed"):
+                print(json.dumps(status, indent=2, default=str))
+                break
+            time.sleep(5)
+
+        # List recent invocations
+        invocations = await client.list_async_invokes(maxResults=5)
+        print(json.dumps(invocations, indent=2, default=str))
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Basic Model Invocation (More control)
 
 For direct model invocation with model-specific request formats:
 
@@ -151,7 +293,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### Streaming Response (More controll)
+### Streaming Response (More control)
 
 ```python
 import json
@@ -187,7 +329,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### Using Guardrails
+### Using Guardrails with Invoke
 
 ```python
 import json
@@ -235,6 +377,8 @@ Client(
     region_name: str,
     assume_role_arn: Optional[str] = None,
     *,
+    profile_name: Optional[str] = None,
+    aws_account_id: Optional[str] = None,
     max_connections: int = 10000,
     request_timeout: Optional[float] = None,
     max_concurrency: Optional[int] = None,
@@ -245,14 +389,14 @@ Client(
 )
 ```
 
-Creates a new Bedrock client instance.
-
-The underlying `aiohttp.ClientSession` is created lazily when first used. You
-can interact with the client by using `async with` or by awaiting individual
-methods directly; both patterns will create a shared session automatically.
+Creates a new Bedrock client instance. The underlying `aiohttp` session and
+TCP connector are created lazily on first use, so the client can safely be
+constructed outside of an async context.
 
 - **region_name**: AWS region where Bedrock is available (e.g., "us-east-1", "us-west-2")
 - **assume_role_arn**: Optional ARN of an IAM role to assume for cross-account access
+- **profile_name**: Optional AWS profile name from `~/.aws/credentials`
+- **aws_account_id**: Optional AWS account ID
 - **max_connections**: Maximum number of connections in the pool (default: 10000)
 - **request_timeout**: Optional request timeout in seconds
 - **max_concurrency**: Optional maximum concurrent requests
@@ -280,6 +424,7 @@ async converse(
     requestMetadata: Optional[Mapping[str, str]] = None,
     performanceConfig: Optional[PerformanceConfigurationTypeDef] = None,
     serviceTier: Optional[ServiceTierConfigTypeDef] = None,
+    outputConfig: Optional[Mapping[str, Any]] = None,
 ) -> bytes
 ```
 
@@ -293,7 +438,8 @@ Invokes a Bedrock model using the Converse API and returns the complete response
 - **guardrailConfig**: Optional guardrail configuration
 - **additionalModelRequestFields**: Optional model-specific parameters
 - **performanceConfig**: Optional performance configuration (`latency`: "standard" or "optimized")
-- **serviceTier**: Optional service tier configuration (`type`: "priority", "default", "flex", or "reserved")
+- **serviceTier**: Optional service tier (`type`: "priority", "default", "flex", or "reserved")
+- **outputConfig**: Optional structured output config (e.g., `{"textFormat": {"type": "json_schema", "structure": {"jsonSchema": {...}}}}`)
 
 #### converse_stream
 
@@ -331,6 +477,84 @@ Runs multiple converse invocations concurrently while preserving the order of re
 Each entry in `requests` must include `modelId` and `messages`; any additional key/value
 pairs are forwarded to `converse`.
 
+#### count_tokens
+
+```python
+async count_tokens(
+    modelId: str,
+    *,
+    messages: Optional[Sequence[MessageTypeDef]] = None,
+    system: Optional[Sequence[SystemContentBlockTypeDef]] = None,
+    invokeModelBody: Optional[Union[str, bytes]] = None,
+) -> Dict[str, Any]
+```
+
+Counts tokens for a given input without invoking the model.
+
+Provide either `messages` (+ optional `system`) for a Converse-style count,
+or `invokeModelBody` for an InvokeModel-style count. Returns a dict with `inputTokens`.
+
+#### apply_guardrail
+
+```python
+async apply_guardrail(
+    guardrailIdentifier: str,
+    guardrailVersion: str,
+    source: str,
+    content: Sequence[Mapping[str, Any]],
+    *,
+    outputScope: Optional[str] = None,
+) -> Dict[str, Any]
+```
+
+Evaluates content against a guardrail without invoking a model. Returns the
+guardrail assessment including `action` ("NONE" or "GUARDRAIL_INTERVENED"),
+`outputs`, and `assessments`.
+
+- **source**: "INPUT" or "OUTPUT"
+- **content**: List of content blocks to evaluate
+
+#### start_async_invoke
+
+```python
+async start_async_invoke(
+    modelId: str,
+    modelInput: Mapping[str, Any],
+    outputDataConfig: Mapping[str, Any],
+    *,
+    clientRequestToken: Optional[str] = None,
+    tags: Optional[Sequence[Mapping[str, str]]] = None,
+) -> Dict[str, Any]
+```
+
+Starts an asynchronous (background) model invocation. The result is written
+to S3 when complete. Returns a dict containing `invocationArn`.
+
+#### get_async_invoke
+
+```python
+async get_async_invoke(invocationArn: str) -> Dict[str, Any]
+```
+
+Gets the status and details of an asynchronous invocation.
+
+#### list_async_invokes
+
+```python
+async list_async_invokes(
+    *,
+    submitTimeAfter: Optional[str] = None,
+    submitTimeBefore: Optional[str] = None,
+    statusEquals: Optional[str] = None,
+    maxResults: Optional[int] = None,
+    nextToken: Optional[str] = None,
+    sortBy: Optional[str] = None,
+    sortOrder: Optional[str] = None,
+) -> Dict[str, Any]
+```
+
+Lists asynchronous invocations with optional filters.
+
 #### invoke_model
 
 ```python
@@ -347,8 +571,8 @@ Invokes a Bedrock model and returns the complete response.
   - **trace**: Tracing level: "ENABLED", "ENABLED_FULL" or "DISABLED" (default: "DISABLED")
   - **guardrailIdentifier**: ARN of the guardrail to use
   - **guardrailVersion**: Version of the guardrail (e.g., "1" or "LATEST")
-  - **performanceConfigLatency**: Performance configuration for latency. Valid values are "standard" or "optimized".
-  - **serviceTier**: Processing tier type. Valid values are "priority", "default", "flex", or "reserved".
+  - **performanceConfigLatency**: "standard" or "optimized"
+  - **serviceTier**: "priority", "default", "flex", or "reserved"
 
 #### invoke_model_with_response_stream
 
@@ -358,11 +582,7 @@ async invoke_model_with_response_stream(body: str, modelId: str, **kwargs) -> As
 
 Invokes a Bedrock model and returns an asynchronous generator. The generator
 yields either parsed JSON objects or raw byte chunks depending on the payload.
-
-- Parameters are the same as `invoke_model`
-- Streaming error events from Bedrock raise `aiobedrock.main.BedrockStreamError`
-  and surface the error payload in the exception message so you can respond or
-  retry appropriately.
+Parameters are the same as `invoke_model`.
 
 #### invoke_many
 
@@ -373,11 +593,6 @@ async invoke_many(requests: Iterable[Mapping[str, Any]], *, concurrency: Optiona
 Runs multiple invocations concurrently while preserving the order of results.
 Each entry in `requests` must include `body` (JSON string) and `modelId`; any
 additional key/value pairs are forwarded to `invoke_model`.
-
-- `concurrency`: Optional per-call limit that overrides the client's global
-  `max_concurrency`.
-- `return_exceptions`: Mirrors `asyncio.gather`; when `True`, exceptions are
-  returned alongside successful responses instead of aborting the batch.
 
 See `example/invoke_many.py` for a complete usage example.
 
@@ -406,25 +621,33 @@ Closes the aiohttp session.
 
 ## Supported Models
 
-aiobedrock supports all models available on AWS Bedrock, AWS Sagemaker
+aiobedrock supports all models available on AWS Bedrock and AWS SageMaker.
 Ensure you have appropriate permissions to access these models in your AWS account.
 
 ## Error Handling
 
-The client provides detailed error messages for common Bedrock API errors:
+The client raises two exception types, both importable from `aiobedrock`:
 
-- 403: AccessDeniedException
-- 408: ModelTimeoutException
-- 424: ModelErrorException
-- 429: ThrottlingException
-- 500: InternalServerException
-- 503: ServiceUnavailableException
+```python
+from aiobedrock import BedrockClientError, BedrockStreamError
+```
 
-In addition, when the streaming API surfaces an error event the library raises
-`BedrockStreamError` with the exception type that Bedrock reported (for
-example `ModelStreamError`) and the payload returned by the service.
+**`BedrockClientError`** is raised on non-200 HTTP responses:
 
-For more error details, refer to the [AWS Bedrock API documentation](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_InvokeModel.html).
+| Status | Error Type |
+|--------|-----------|
+| 403 | AccessDeniedException |
+| 408 | ModelTimeoutException |
+| 424 | ModelErrorException |
+| 429 | ThrottlingException |
+| 500 | InternalServerException |
+| 503 | ServiceUnavailableException |
+
+**`BedrockStreamError`** is raised when a streaming response contains an error event
+from Bedrock (e.g., `ModelStreamError`). The exception includes the error type
+and payload returned by the service.
+
+For more details, refer to the [AWS Bedrock API documentation](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_InvokeModel.html).
 
 ## License
 

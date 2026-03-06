@@ -87,12 +87,13 @@ class Client:
         self.assume_role_arn = assume_role_arn
         self.profile_name = profile_name
         self.aws_account_id = aws_account_id
-        self.connector = aiohttp.TCPConnector(
-            limit=max_connections,
-            ttl_dns_cache=3600,
-            use_dns_cache=True,
-            enable_cleanup_closed=True,
-        )
+        self._connector_kwargs = {
+            "limit": max_connections,
+            "ttl_dns_cache": 3600,
+            "use_dns_cache": True,
+            "enable_cleanup_closed": True,
+        }
+        self.connector = None
         self.session = None
         self.expiration = None
         self.access_key = None
@@ -216,6 +217,8 @@ class Client:
         """Create the shared aiohttp session on first use."""
 
         if self.session is None or getattr(self.session, "closed", False):
+            if self.connector is None or getattr(self.connector, "closed", False):
+                self.connector = aiohttp.TCPConnector(**self._connector_kwargs)
             session_kwargs: Dict[str, Any] = {"connector": self.connector}
             if self._client_timeout is not None:
                 session_kwargs["timeout"] = self._client_timeout
@@ -757,7 +760,7 @@ class Client:
                 ),
                 (
                     "serviceTier",
-                    "X-Amzn-Bedrock-ServiceTier",
+                    "X-Amzn-Bedrock-Service-Tier",
                 ),
             ]
 
@@ -782,6 +785,52 @@ class Client:
         # Sign the request
         SigV4Auth(credentials, service, region_name).add_auth(request)
         return dict(request.headers)
+
+    def _build_converse_body(
+        self,
+        messages,
+        *,
+        system=None,
+        inferenceConfig=None,
+        toolConfig=None,
+        guardrailConfig=None,
+        additionalModelRequestFields=None,
+        additionalModelResponseFieldPaths=None,
+        promptVariables=None,
+        requestMetadata=None,
+        performanceConfig=None,
+        serviceTier=None,
+        outputConfig=None,
+    ) -> Dict[str, Any]:
+        """Build the JSON body dict for Converse / ConverseStream requests."""
+        body_dict: Dict[str, Any] = {"messages": list(messages)}
+
+        if system is not None:
+            body_dict["system"] = list(system)
+        if inferenceConfig is not None:
+            body_dict["inferenceConfig"] = inferenceConfig
+        if toolConfig is not None:
+            body_dict["toolConfig"] = toolConfig
+        if guardrailConfig is not None:
+            body_dict["guardrailConfig"] = guardrailConfig
+        if additionalModelRequestFields is not None:
+            body_dict["additionalModelRequestFields"] = additionalModelRequestFields
+        if additionalModelResponseFieldPaths is not None:
+            body_dict["additionalModelResponseFieldPaths"] = list(
+                additionalModelResponseFieldPaths
+            )
+        if promptVariables is not None:
+            body_dict["promptVariables"] = promptVariables
+        if requestMetadata is not None:
+            body_dict["requestMetadata"] = requestMetadata
+        if performanceConfig is not None:
+            body_dict["performanceConfig"] = performanceConfig
+        if serviceTier is not None:
+            body_dict["serviceTier"] = serviceTier
+        if outputConfig is not None:
+            body_dict["outputConfig"] = outputConfig
+
+        return body_dict
 
     async def converse(
         self,
@@ -810,6 +859,7 @@ class Client:
         serviceTier: Optional[
             Union["ServiceTierConfigTypeDef", Mapping[str, Any]]
         ] = None,
+        outputConfig: Optional[Mapping[str, Any]] = None,
     ) -> bytes:
         """
         Invoke a model using the Converse API and return the response as bytes.
@@ -819,32 +869,20 @@ class Client:
         """
         url = f"https://bedrock-runtime.{self.region_name}.amazonaws.com/model/{modelId}/converse"  # noqa: E501
 
-        # Build request body - only include non-None values
-        body_dict: Dict[str, Any] = {"messages": list(messages)}
-
-        if system is not None:
-            body_dict["system"] = list(system)
-        if inferenceConfig is not None:
-            body_dict["inferenceConfig"] = inferenceConfig
-        if toolConfig is not None:
-            body_dict["toolConfig"] = toolConfig
-        if guardrailConfig is not None:
-            body_dict["guardrailConfig"] = guardrailConfig
-        if additionalModelRequestFields is not None:
-            body_dict["additionalModelRequestFields"] = additionalModelRequestFields
-        if additionalModelResponseFieldPaths is not None:
-            body_dict["additionalModelResponseFieldPaths"] = list(
-                additionalModelResponseFieldPaths
-            )
-        if promptVariables is not None:
-            body_dict["promptVariables"] = promptVariables
-        if requestMetadata is not None:
-            body_dict["requestMetadata"] = requestMetadata
-        if performanceConfig is not None:
-            body_dict["performanceConfig"] = performanceConfig
-        if serviceTier is not None:
-            body_dict["serviceTier"] = serviceTier
-
+        body_dict = self._build_converse_body(
+            messages=messages,
+            system=system,
+            inferenceConfig=inferenceConfig,
+            toolConfig=toolConfig,
+            guardrailConfig=guardrailConfig,
+            additionalModelRequestFields=additionalModelRequestFields,
+            additionalModelResponseFieldPaths=additionalModelResponseFieldPaths,
+            promptVariables=promptVariables,
+            requestMetadata=requestMetadata,
+            performanceConfig=performanceConfig,
+            serviceTier=serviceTier,
+            outputConfig=outputConfig,
+        )
         body = orjson.dumps(body_dict)
 
         attempt = 0
@@ -971,6 +1009,7 @@ class Client:
         serviceTier: Optional[
             Union["ServiceTierConfigTypeDef", Mapping[str, Any]]
         ] = None,
+        outputConfig: Optional[Mapping[str, Any]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Invoke a model using the ConverseStream API with streaming response.
@@ -983,32 +1022,20 @@ class Client:
         """
         url = f"https://bedrock-runtime.{self.region_name}.amazonaws.com/model/{modelId}/converse-stream"  # noqa: E501
 
-        # Build request body - only include non-None values
-        body_dict: Dict[str, Any] = {"messages": list(messages)}
-
-        if system is not None:
-            body_dict["system"] = list(system)
-        if inferenceConfig is not None:
-            body_dict["inferenceConfig"] = inferenceConfig
-        if toolConfig is not None:
-            body_dict["toolConfig"] = toolConfig
-        if guardrailConfig is not None:
-            body_dict["guardrailConfig"] = guardrailConfig
-        if additionalModelRequestFields is not None:
-            body_dict["additionalModelRequestFields"] = additionalModelRequestFields
-        if additionalModelResponseFieldPaths is not None:
-            body_dict["additionalModelResponseFieldPaths"] = list(
-                additionalModelResponseFieldPaths
-            )
-        if promptVariables is not None:
-            body_dict["promptVariables"] = promptVariables
-        if requestMetadata is not None:
-            body_dict["requestMetadata"] = requestMetadata
-        if performanceConfig is not None:
-            body_dict["performanceConfig"] = performanceConfig
-        if serviceTier is not None:
-            body_dict["serviceTier"] = serviceTier
-
+        body_dict = self._build_converse_body(
+            messages=messages,
+            system=system,
+            inferenceConfig=inferenceConfig,
+            toolConfig=toolConfig,
+            guardrailConfig=guardrailConfig,
+            additionalModelRequestFields=additionalModelRequestFields,
+            additionalModelResponseFieldPaths=additionalModelResponseFieldPaths,
+            promptVariables=promptVariables,
+            requestMetadata=requestMetadata,
+            performanceConfig=performanceConfig,
+            serviceTier=serviceTier,
+            outputConfig=outputConfig,
+        )
         body = orjson.dumps(body_dict)
 
         attempt = 0
@@ -1152,3 +1179,246 @@ class Client:
                     task.cancel()
 
         return results
+
+    async def count_tokens(
+        self,
+        modelId: str,
+        *,
+        messages: Optional[
+            Union[Sequence["MessageTypeDef"], Sequence[Mapping[str, Any]]]
+        ] = None,
+        system: Optional[
+            Union[Sequence["SystemContentBlockTypeDef"], Sequence[Mapping[str, Any]]]
+        ] = None,
+        invokeModelBody: Optional[Union[str, bytes]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Count tokens for a given input.
+
+        Provide either (messages + optional system) for a Converse-style count,
+        or invokeModelBody for an InvokeModel-style count.
+        """
+        url = f"https://bedrock-runtime.{self.region_name}.amazonaws.com/model/{modelId}/count-tokens"  # noqa: E501
+
+        input_dict: Dict[str, Any] = {}
+        if messages is not None:
+            converse_input: Dict[str, Any] = {"messages": list(messages)}
+            if system is not None:
+                converse_input["system"] = list(system)
+            input_dict["converse"] = converse_input
+        elif invokeModelBody is not None:
+            body_str = (
+                invokeModelBody
+                if isinstance(invokeModelBody, str)
+                else invokeModelBody.decode("utf-8")
+            )
+            input_dict["invokeModel"] = {"body": body_str}
+        else:
+            raise ValueError(
+                "Provide either 'messages' (Converse) or 'invokeModelBody' (InvokeModel)"
+            )
+
+        body = orjson.dumps({"input": input_dict})
+
+        attempt = 0
+        while True:
+            await self._ensure_valid_credentials()
+            headers = self._signed_request(
+                body=body,
+                url=url,
+                method="POST",
+                credentials=self.credentials,
+                region_name=self.region_name,
+            )
+
+            try:
+                async with self._request(url=url, headers=headers, data=body) as res:
+                    await self._handle_error_response(res)
+                    return orjson.loads(await res.read())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not self._should_retry(exc, attempt):
+                    raise
+                await self._sleep_backoff(attempt)
+                attempt += 1
+
+    async def apply_guardrail(
+        self,
+        guardrailIdentifier: str,
+        guardrailVersion: str,
+        source: str,
+        content: Sequence[Mapping[str, Any]],
+        *,
+        outputScope: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Apply a guardrail to content without invoking a model.
+
+        Args:
+            guardrailIdentifier: The guardrail identifier.
+            guardrailVersion: The guardrail version.
+            source: Where the content comes from ("INPUT" or "OUTPUT").
+            content: List of content blocks to evaluate.
+            outputScope: Optional output scope.
+        """
+        url = (
+            f"https://bedrock-runtime.{self.region_name}.amazonaws.com"
+            f"/guardrail/{guardrailIdentifier}/version/{guardrailVersion}/apply"
+        )
+
+        body_dict: Dict[str, Any] = {
+            "source": source,
+            "content": list(content),
+        }
+        if outputScope is not None:
+            body_dict["outputScope"] = outputScope
+
+        body = orjson.dumps(body_dict)
+
+        attempt = 0
+        while True:
+            await self._ensure_valid_credentials()
+            headers = self._signed_request(
+                body=body,
+                url=url,
+                method="POST",
+                credentials=self.credentials,
+                region_name=self.region_name,
+            )
+
+            try:
+                async with self._request(url=url, headers=headers, data=body) as res:
+                    await self._handle_error_response(res)
+                    return orjson.loads(await res.read())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not self._should_retry(exc, attempt):
+                    raise
+                await self._sleep_backoff(attempt)
+                attempt += 1
+
+    async def start_async_invoke(
+        self,
+        modelId: str,
+        modelInput: Mapping[str, Any],
+        outputDataConfig: Mapping[str, Any],
+        *,
+        clientRequestToken: Optional[str] = None,
+        tags: Optional[Sequence[Mapping[str, str]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Start an asynchronous model invocation.
+
+        Args:
+            modelId: The model identifier.
+            modelInput: The model input (same format as InvokeModel body).
+            outputDataConfig: Where to store the output (e.g. S3 location).
+            clientRequestToken: Idempotency token.
+            tags: Tags for the invocation.
+        """
+        url = f"https://bedrock-runtime.{self.region_name}.amazonaws.com/async-invoke"
+
+        body_dict: Dict[str, Any] = {
+            "modelId": modelId,
+            "modelInput": dict(modelInput),
+            "outputDataConfig": dict(outputDataConfig),
+        }
+        if clientRequestToken is not None:
+            body_dict["clientRequestToken"] = clientRequestToken
+        if tags is not None:
+            body_dict["tags"] = list(tags)
+
+        body = orjson.dumps(body_dict)
+
+        await self._ensure_valid_credentials()
+        headers = self._signed_request(
+            body=body,
+            url=url,
+            method="POST",
+            credentials=self.credentials,
+            region_name=self.region_name,
+        )
+
+        async with self._request(url=url, headers=headers, data=body) as res:
+            await self._handle_error_response(res)
+            return orjson.loads(await res.read())
+
+    async def get_async_invoke(
+        self,
+        invocationArn: str,
+    ) -> Dict[str, Any]:
+        """Get the status and details of an asynchronous invocation."""
+        url = (
+            f"https://bedrock-runtime.{self.region_name}.amazonaws.com"
+            f"/async-invoke/{invocationArn}"
+        )
+
+        await self._ensure_valid_credentials()
+        headers = self._signed_request(
+            body=b"",
+            url=url,
+            method="GET",
+            credentials=self.credentials,
+            region_name=self.region_name,
+        )
+
+        session = self._ensure_session()
+        get_kwargs: Dict[str, Any] = {"url": url, "headers": headers}
+        if self._client_timeout is not None:
+            get_kwargs["timeout"] = self._client_timeout
+
+        async with session.get(**get_kwargs) as res:
+            await self._handle_error_response(res)
+            return orjson.loads(await res.read())
+
+    async def list_async_invokes(
+        self,
+        *,
+        submitTimeAfter: Optional[str] = None,
+        submitTimeBefore: Optional[str] = None,
+        statusEquals: Optional[str] = None,
+        maxResults: Optional[int] = None,
+        nextToken: Optional[str] = None,
+        sortBy: Optional[str] = None,
+        sortOrder: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """List asynchronous invocations with optional filters."""
+        params = {}
+        if submitTimeAfter is not None:
+            params["submitTimeAfter"] = submitTimeAfter
+        if submitTimeBefore is not None:
+            params["submitTimeBefore"] = submitTimeBefore
+        if statusEquals is not None:
+            params["statusEquals"] = statusEquals
+        if maxResults is not None:
+            params["maxResults"] = str(maxResults)
+        if nextToken is not None:
+            params["nextToken"] = nextToken
+        if sortBy is not None:
+            params["sortBy"] = sortBy
+        if sortOrder is not None:
+            params["sortOrder"] = sortOrder
+
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        base = f"https://bedrock-runtime.{self.region_name}.amazonaws.com/async-invoke"
+        url = f"{base}?{query}" if query else base
+
+        await self._ensure_valid_credentials()
+        headers = self._signed_request(
+            body=b"",
+            url=url,
+            method="GET",
+            credentials=self.credentials,
+            region_name=self.region_name,
+        )
+
+        session = self._ensure_session()
+        get_kwargs: Dict[str, Any] = {"url": url, "headers": headers}
+        if self._client_timeout is not None:
+            get_kwargs["timeout"] = self._client_timeout
+
+        async with session.get(**get_kwargs) as res:
+            await self._handle_error_response(res)
+            return orjson.loads(await res.read())

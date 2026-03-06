@@ -88,6 +88,7 @@ dist-ssr
 
 # Python
 *.pyc
+*.egg-info/
 .venv
 myenv
 .uv_cache

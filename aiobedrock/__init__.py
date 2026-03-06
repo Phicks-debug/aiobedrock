@@ -1,3 +1,3 @@
-from .main import Client
+from .main import BedrockClientError, BedrockStreamError, Client
 
-__all__ = ["Client"]
+__all__ = ["Client", "BedrockClientError", "BedrockStreamError"]
